@@ -1,0 +1,9 @@
+{
+  "name": "chrome-mcp-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Clean-room Chrome MCP bridge extension + mcp CLI for the com.chromemcp.nativehost bridge",
+  "bin": {
+    "mcp": "scripts/mcp.js"
+  }
+}
