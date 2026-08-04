@@ -20,9 +20,6 @@
 //   tools             List bridge tools
 //   call <tool> '{}'  Raw tool call with JSON args
 //   storage           localStorage/sessionStorage/cookies/IndexedDB summary
-//   sn-state          Standard Notes key/lock state summary
-//   unlock <pass>     Unlock the SN passcode lock screen
-//   lock              Re-lock SN (click the lock item)
 //   repl              Interactive session (single persistent MCP session)
 //   help
 //
@@ -302,62 +299,6 @@ async function cmdStorage(sessionId, flags) {
   return callTool(sessionId, 'chrome_javascript', Object.assign({ code }, tabArg(flags)));
 }
 
-async function cmdSnState(sessionId, flags) {
-  const code = `return (async () => {
-    const out = {};
-    out.lockScreen = document.body.innerText.slice(0, 60);
-    out.keychain = localStorage.getItem('keychain');
-    try {
-      const app = window.mainApplicationGroup && window.mainApplicationGroup.primaryApplication;
-      if (!app) { out.app = 'none'; return JSON.stringify(out); }
-      const m = app.dependencies && app.dependencies.dependencies;
-      const get = (name) => { if (!m) return null; for (const [k, v] of m.entries()) { const d = (typeof k === 'symbol') ? (k.description || k.toString()) : String(k); if (d === name) return v; } return null; };
-      const rkm = get('RootKeyManager');
-      if (rkm) {
-        try { out.hasPasscode = await rkm.hasPasscode(); } catch (e) { out.hasPasscode = 'err'; }
-        try { out.hasRootKeyWrapper = await rkm.hasRootKeyWrapper(); } catch (e) { out.hasRootKeyWrapper = 'err'; }
-        out.keyMode = rkm.keyMode;
-        try { const rk = await rkm.getRootKey(); out.rootKeyInMemory = rk ? 'PRESENT' : 'null'; } catch (e) { out.rootKeyInMemory = 'err'; }
-        try { const rk2 = await rkm.getRootKeyFromKeychain(); out.rootKeyFromKeychain = rk2 ? 'PRESENT' : 'null'; } catch (e) { out.rootKeyFromKeychain = 'err'; }
-      }
-      const es = get('EncryptionService');
-      if (es) { try { out.isPasscodeLocked = await es.isPasscodeLocked(); } catch (e) { out.isPasscodeLocked = 'err'; } }
-      const ims = get('InMemoryStore');
-      if (ims) { out.inMemoryStore = JSON.stringify(ims.values || {}).slice(0, 60); }
-      const im = get('ItemManager');
-      if (im && im.collection) { const arr = im.collection.all ? im.collection.all() : []; out.itemsInMemory = arr.length; }
-      try {
-        const db = await new Promise((r) => { const q = indexedDB.open('standardnotes'); q.onsuccess = (e) => r(e.target.result); q.onerror = () => r(null); });
-        if (db) { const cnt = await new Promise((r) => { const t = db.transaction('items').objectStore('items').count(); t.onsuccess = () => r(t.result); t.onerror = () => r(-1); }); out.indexedItems = cnt; }
-      } catch (e) { out.indexedErr = String(e).slice(0, 60); }
-    } catch (e) { out.err = String(e).slice(0, 200); }
-    return JSON.stringify(out);
-  })()`;
-  return callTool(sessionId, 'chrome_javascript', Object.assign({ code }, tabArg(flags)));
-}
-
-async function cmdUnlock(sessionId, flags, passcode) {
-  const code = `(() => {
-    const input = document.querySelector('input[placeholder="Application Passcode"]');
-    if (!input) return JSON.stringify({ ok: false, why: 'no passcode input found (maybe already unlocked)' });
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    setter.call(input, ${JSON.stringify(passcode)});
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    const submit = [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Submit');
-    if (submit) submit.click();
-    return JSON.stringify({ ok: true, submitted: true });
-  })()`;
-  const r = await callTool(sessionId, 'chrome_javascript', Object.assign({ code }, tabArg(flags)));
-  await new Promise((res) => setTimeout(res, 1200));
-  const after = await cmdRead(sessionId, flags);
-  return { unlock: r, pageAfter: after.text.slice(0, 200) };
-}
-
-async function cmdLock(sessionId, flags) {
-  const r = await callTool(sessionId, 'chrome_click_element', Object.assign({ selector: '#lock-item' }, tabArg(flags)));
-  return r;
-}
-
 // --------------------------------------------------------------------- REPL ---
 async function repl(sessionId, flags) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
@@ -385,9 +326,6 @@ async function repl(sessionId, flags) {
         else if (cmd === 'nav') out = await cmdNav(sessionId, flags, rest);
         else if (cmd === 'shot') out = await cmdShot(sessionId, flags);
         else if (cmd === 'storage') out = await cmdStorage(sessionId, flags);
-        else if (cmd === 'sn-state') out = await cmdSnState(sessionId, flags);
-        else if (cmd === 'unlock') out = await cmdUnlock(sessionId, flags, rest);
-        else if (cmd === 'lock') out = await cmdLock(sessionId, flags);
         else if (cmd === 'status') out = await cmdStatus(sessionId, flags);
         else if (cmd === 'help') { console.log(USAGE); return; }
         else out = { ok: false, text: 'unknown command: ' + cmd + ' (try: help)' };
@@ -424,9 +362,6 @@ Commands:
   tools                  List bridge tools
   call <tool> '{"args":…}'  Raw tool call
   storage                Dump browser storage
-  sn-state               Standard Notes key/lock state
-  unlock <passcode>      Unlock SN passcode lock screen
-  lock                   Re-lock SN
   repl                   Interactive session
   help`;
 
@@ -459,9 +394,6 @@ async function main() {
       case 'tools': out = await cmdTools(sessionId, flags); break;
       case 'call': out = await cmdCall(sessionId, flags, rest[0], rest[1]); break;
       case 'storage': out = await cmdStorage(sessionId, flags); break;
-      case 'sn-state': out = await cmdSnState(sessionId, flags); break;
-      case 'unlock': out = await cmdUnlock(sessionId, flags, rest[0] || ''); break;
-      case 'lock': out = await cmdLock(sessionId, flags); break;
       case 'repl': await repl(sessionId, flags); out = null; break;
       default: console.error('unknown command: ' + command + '\n' + USAGE); process.exitCode = 2; out = null;
     }

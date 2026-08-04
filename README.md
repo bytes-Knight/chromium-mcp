@@ -153,9 +153,6 @@ mcp shot --full --out page.png
 mcp tools                 # list bridge tools
 mcp call <tool> '{"k":1}' # raw tool call
 mcp storage               # localStorage/sessionStorage/cookies/IndexedDB
-mcp sn-state              # Standard Notes key/lock state summary
-mcp unlock '<passcode>'   # unlock the SN passcode lock screen
-mcp lock                  # re-lock SN
 
 mcp repl                  # interactive session (single persistent MCP session)
 mcp help
