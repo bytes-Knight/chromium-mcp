@@ -1,0 +1,5 @@
+# build artifacts (git-ignored; rebuild with: node app\build.js)
+app/dist/
+app/sea-prep.blob
+app/sea-config.json
+node_modules/

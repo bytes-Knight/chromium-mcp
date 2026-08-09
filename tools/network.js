@@ -85,13 +85,7 @@ registerTool('chrome_network_capture', async (args = {}) => {
       session.lastActivity = Date.now();
     };
     session.listener = (details) => record(details);
-    session.completedListener = (details) => {
-      record(details);
-      if (session.needResponseBody && session.debuggerAttached) {
-        // Body fetched via debugger session separately
-      }
-    };
-    session.headersListener = (details) => record(details);
+    session.completedListener = (details) => record(details);
 
     chrome.webRequest.onBeforeRequest.addListener(session.listener, { urls: ['<all_urls>'] });
     chrome.webRequest.onCompleted.addListener(session.completedListener, { urls: ['<all_urls>'] });
@@ -142,7 +136,7 @@ async function runNetworkStop(tabId) {
 
   if (session.listener) chrome.webRequest.onBeforeRequest.removeListener(session.listener);
   if (session.completedListener) chrome.webRequest.onCompleted.removeListener(session.completedListener);
-  if (session.headersListener) chrome.webRequest.onErrorOccurred.removeListener(session.headersListener);
+  if (session.listener) chrome.webRequest.onErrorOccurred.removeListener(session.listener);
   clearTimeout(session.maxTimer);
   clearInterval(session.inactivityTimer);
 

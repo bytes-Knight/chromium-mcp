@@ -20,7 +20,6 @@ importScripts(
 let port = null;
 let connected = false;
 let serverRunning = false;
-let startAttempts = 0;
 let mcpPort = DEFAULT_MCP_PORT;
 
 const pendingReplies = new Map(); // requestId -> {resolve, reject}
@@ -32,7 +31,6 @@ function ensurePort() {
     port.onMessage.addListener(onNativeMessage);
     port.onDisconnect.addListener(onPortDisconnect);
     connected = true;
-    startAttempts = 0;
     // Ask the host to start the local MCP server
     port.postMessage({ type: MSG.START, payload: { port: mcpPort } });
     updateStatus();
@@ -52,11 +50,10 @@ function onPortDisconnect() {
   pendingReplies.forEach((p) => p.reject(new Error('Native host disconnected')));
   pendingReplies.clear();
   updateStatus();
-  // Auto-retry a few times (the host may have been restarted)
-  if (startAttempts < 5) {
-    startAttempts++;
-    setTimeout(ensurePort, 1500 * startAttempts);
-  }
+  // Auto-retry via alarms (SW-safe — setTimeout gets throttled in a service
+  // worker, and giving up after N tries leaves the bridge dead until the user
+  // clicks Connect). The alarm keeps retrying every 30s until we're back.
+  chrome.alarms.create('bridge-reconnect', { periodInMinutes: 0.5 });
 }
 
 function onNativeMessage(msg) {
@@ -76,6 +73,7 @@ function onNativeMessage(msg) {
   switch (msg.type) {
     case MSG.SERVER_STARTED:
       serverRunning = true;
+      chrome.alarms.clear('bridge-reconnect');
       updateStatus();
       break;
     case MSG.SERVER_STOPPED:
@@ -190,7 +188,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Keep the worker alive while the native port is open
 chrome.alarms.create('bridge-keepalive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'bridge-keepalive' && port) {
+  if (alarm.name === 'bridge-reconnect') {
+    if (!port && !connected) {
+      ensurePort();
+    } else {
+      chrome.alarms.clear('bridge-reconnect');
+    }
+  } else if (alarm.name === 'bridge-keepalive' && port) {
     try { port.postMessage({ type: 'ping_from_extension' }); } catch (e) { /* ignore */ }
   }
 });
