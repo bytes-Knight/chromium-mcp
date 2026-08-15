@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/mcp.js — single CLI for the mcp-chrome-bridge (127.0.0.1:12306).
 //
-//   node scripts/mcp.js <command> [args] [--json]
+//   node scripts/mcp.js <command> [args] [--json] [--tab <id>]
 //
 // Commands:
 //   status            Bridge health + host PID
@@ -9,13 +9,33 @@
 //   tabs              List windows and tabs
 //   active            Active tab info
 //   switch <tabId>    Switch to tab
+//   open <url> [...]  Open new tab(s): --bg, --pin, --window <id>, --index N
+//   close <targets>   Close tabs: ids, url:<u>, domain:<d>, all, others [--keep ids],
+//                     window <ids>; --all closes every tab
+//   dup <ids>         Duplicate tab(s)
+//   reload [ids|--all] [--cache]
+//   discard [ids|--all]
+//   pin <ids>         Pin tab(s)
+//   unpin <ids>       Unpin tab(s)
+//   mute <ids>        Mute tab(s)
+//   unmute <ids>      Unmute tab(s)
+//   move <ids>        Move tabs: --window <id>, --index N
+//   group <ids>       Group tabs: --name X, --color C; also: ungroup <ids>, groups
+//   search <query>    Find tabs by title/URL/host
+//   content-search <query>
+//   window            new|close|state|arrange|focus (see "mcp window help")
+//   zoom [f|in|out|reset]
+//   cookies           list/get/set/delete for a URL
+//   downloads         list|cancel|pause|resume|erase|open|show
+//   trace             start [--reload] [--auto] [--duration MS] | stop | analyze
+//  gif                    start [--fps N] [--auto] | stop [--base64] [--out file.gif] | status | capture | export
 //   read [opts]       Read page: --interactive, --depth N, --ref X, --tab T
 //   eval '<js>'       Run a JS expression (returned)
 //   run '<js>'        Run a JS block (full async body; must return)
 //   click <sel|ref>   Click element (CSS selector or ref_)
 //   fill <sel|ref> <v>  Fill form value
 //   keys '<keys>'     Simulate key presses (e.g. "Enter", "ctrl+a")
-//   nav <url|cmd>     Navigate: url | back | forward | reload
+//   nav <url|cmd>     Navigate: url | back | forward | reload; --new-tab opens a new tab
 //   shot [opts]       Screenshot: --full, --out file.png
 //   tools             List bridge tools
 //   call <tool> '{}'  Raw tool call with JSON args
@@ -61,7 +81,7 @@ async function initSession() {
   const init = await mcpRpc('initialize', {
     protocolVersion: '2024-11-05',
     capabilities: {},
-    clientInfo: { name: 'mcp-cli', version: '2.0.0' },
+    clientInfo: { name: 'mcp-cli', version: '2.1.0' },
   }, null);
   if (init.status !== 200 || !init.sessionId) {
     const err = (init.parsed && (init.parsed.message || init.parsed.error)) || JSON.stringify(init).slice(0, 200);
@@ -170,23 +190,31 @@ function printOut(obj, json) {
 
 // ------------------------------------------------------------------- utils ---
 function parseArgs(argv) {
-  const flags = { json: false, interactive: false, full: false };
+  const flags = {};
   const positional = [];
+  const valueFlags = new Set(['--window', '--keep', '--name', '--color', '--w', '--h', '--state', '--layout', '--duration', '--fps', '--index', '--limit', '--tab', '--out', '--depth', '--ref', '--query', '--path', '--domain']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--json') flags.json = true;
-    else if (a === '--interactive') flags.interactive = true;
-    else if (a === '--full') flags.full = true;
-    else if (a === '--depth') flags.depth = parseInt(argv[++i], 10);
-    else if (a === '--ref') flags.ref = argv[++i];
-    else if (a === '--tab') flags.tab = parseInt(argv[++i], 10);
-    else if (a === '--out') flags.out = argv[++i];
+    if (valueFlags.has(a)) flags[a.slice(2)] = argv[++i];
+    else if (a.startsWith('--')) flags[a.slice(2)] = true;
     else positional.push(a);
   }
   return { flags, positional };
 }
 
-function tabArg(flags) { return flags.tab ? { tabId: flags.tab } : {}; }
+function tabArg(flags) { return flags.tab ? { tabId: Number(flags.tab) } : {}; }
+
+// Parse "12 13,14" into [12,13,14].
+function idsFrom(items) {
+  const out = [];
+  for (const item of items) {
+    for (const part of String(item).split(',')) {
+      const n = Number(part.trim());
+      if (!isNaN(n)) out.push(n);
+    }
+  }
+  return out;
+}
 
 // ------------------------------------------------------------- sub-commands ---
 async function cmdStatus(sessionId, flags) {
@@ -196,8 +224,7 @@ async function cmdStatus(sessionId, flags) {
 }
 
 async function cmdTabs(sessionId, flags) {
-  const r = await callTool(sessionId, 'get_windows_and_tabs', {});
-  return r;
+  return callTool(sessionId, 'get_windows_and_tabs', {});
 }
 
 async function cmdActive(sessionId, flags) {
@@ -209,10 +236,322 @@ async function cmdActive(sessionId, flags) {
   } catch (e) { return r; }
 }
 
+async function cmdOpen(sessionId, flags, urls) {
+  if (!urls.length) return { ok: false, text: 'usage: open <url> [url2 …] [--bg] [--pin] [--window <id>] [--index N]' };
+  const args = {
+    urls,
+    active: !flags.bg,
+  };
+  if (flags.pin) args.pinned = true;
+  if (flags.window) args.windowId = Number(flags.window);
+  if (flags.index) args.index = Number(flags.index);
+  return callTool(sessionId, 'chrome_open_tabs', args);
+}
+
+async function cmdClose(sessionId, flags, targets) {
+  const args = {};
+  if (targets.includes('all')) {
+    args.all = true;
+  } else if (targets.includes('others')) {
+    let keep = flags.keep ? idsFrom([flags.keep]) : null;
+    if (!keep || !keep.length) {
+      // Keep the current active tab so the browser never ends up empty.
+      const r = await callTool(sessionId, 'get_windows_and_tabs', {});
+      try {
+        const wins = JSON.parse(r.text);
+        const active = wins.flatMap((w) => w.tabs).find((t) => t.active);
+        keep = active ? [active.id] : [];
+      } catch (e) { keep = []; }
+    }
+    args.allExcept = keep;
+  } else if (targets[0] === 'window') {
+    const ids = idsFrom(targets.slice(1));
+    if (!ids.length) return { ok: false, text: 'usage: close window <windowId> …' };
+    return callTool(sessionId, 'chrome_close_tabs', { windowIds: ids });
+  } else {
+    const tabIds = [];
+    let url = null;
+    let domain = null;
+    for (const t of targets) {
+      if (t.startsWith('url:')) url = t.slice(4);
+      else if (t.startsWith('domain:')) domain = t.slice(7);
+      else {
+        const n = Number(t);
+        if (!isNaN(n)) tabIds.push(n);
+      }
+    }
+    if (tabIds.length) args.tabIds = tabIds;
+    else if (url) args.url = url;
+    else if (domain) args.domain = domain;
+    else return { ok: false, text: 'usage: close <tabIds…> | url:<u> | domain:<d> | all | others [--keep ids] | window <ids>' };
+  }
+  return callTool(sessionId, 'chrome_close_tabs', args);
+}
+
+async function cmdDup(sessionId, flags, ids) {
+  if (!ids.length) return { ok: false, text: 'usage: dup <tabId> [tabId …]' };
+  return callTool(sessionId, 'chrome_duplicate_tabs', { tabIds: ids });
+}
+
+async function cmdReload(sessionId, flags, ids) {
+  const args = { bypassCache: !!flags.cache };
+  if (flags.all) args.all = true;
+  else if (ids.length) args.tabIds = ids;
+  else Object.assign(args, tabArg(flags));
+  return callTool(sessionId, 'chrome_reload_tabs', args);
+}
+
+async function cmdDiscard(sessionId, flags, ids) {
+  const args = {};
+  if (flags.all) args.all = true;
+  else if (ids.length) args.tabIds = ids;
+  else Object.assign(args, tabArg(flags));
+  return callTool(sessionId, 'chrome_discard_tabs', args);
+}
+
+async function cmdPinUnpin(sessionId, flags, ids, mode) {
+  if (!ids.length) return { ok: false, text: `usage: ${mode} <tabId> [tabId …]` };
+  return callTool(sessionId, mode === 'pin' ? 'chrome_pin_tabs' : 'chrome_unpin_tabs', { tabIds: ids });
+}
+
+async function cmdMuteUnmute(sessionId, flags, ids, mode) {
+  if (!ids.length) return { ok: false, text: `usage: ${mode} <tabId> [tabId …]` };
+  return callTool(sessionId, mode === 'mute' ? 'chrome_mute_tabs' : 'chrome_unmute_tabs', { tabIds: ids });
+}
+
+async function cmdMove(sessionId, flags, ids) {
+  if (!ids.length) return { ok: false, text: 'usage: move <tabId> [tabId …] [--window <id>] [--index N]' };
+  const args = { tabIds: ids };
+  if (flags.window) args.windowId = Number(flags.window);
+  if (flags.index) args.index = Number(flags.index);
+  return callTool(sessionId, 'chrome_move_tabs', args);
+}
+
+async function cmdGroup(sessionId, flags, ids) {
+  if (!ids.length) return { ok: false, text: 'usage: group <tabId> [tabId …] [--name X] [--color C]' };
+  const args = { tabIds: ids };
+  if (flags.name) args.title = flags.name;
+  if (flags.color) args.color = flags.color;
+  if (flags.window) args.windowId = Number(flags.window);
+  return callTool(sessionId, 'chrome_group_tabs', args);
+}
+
+async function cmdUngroup(sessionId, flags, ids) {
+  const args = {};
+  if (ids.length) args.tabIds = ids;
+  else return { ok: false, text: 'usage: ungroup <tabId> [tabId …]' };
+  return callTool(sessionId, 'chrome_ungroup_tabs', args);
+}
+
+async function cmdGroups(sessionId, flags) {
+  return callTool(sessionId, 'chrome_tab_groups', {});
+}
+
+async function cmdSearch(sessionId, flags, query) {
+  if (!query) return { ok: false, text: 'usage: search <query>' };
+  const args = { query };
+  if (flags.window) args.windowId = Number(flags.window);
+  return callTool(sessionId, 'chrome_search_tabs', args);
+}
+
+async function cmdContentSearch(sessionId, flags, query) {
+  if (!query) return { ok: false, text: 'usage: content-search <query>' };
+  const args = { query };
+  if (flags.limit) args.maxResults = Number(flags.limit);
+  return callTool(sessionId, 'chrome_search_tabs_content', args);
+}
+
+async function cmdWindow(sessionId, flags, rest) {
+  const sub = rest[0] || 'help';
+  switch (sub) {
+    case 'new': {
+      const urls = rest.slice(1);
+      const args = { urls, focused: true };
+      if (flags.incognito) args.incognito = true;
+      if (flags.w) args.width = Number(flags.w);
+      if (flags.h) args.height = Number(flags.h);
+      if (flags.state) args.state = flags.state;
+      return callTool(sessionId, 'chrome_new_window', args);
+    }
+    case 'close': {
+      const args = {};
+      if (flags.all) args.all = true;
+      else if (flags.current) args.current = true;
+      else {
+        const ids = idsFrom(rest.slice(1));
+        if (ids.length) args.windowIds = ids;
+        else return { ok: false, text: 'usage: window close <windowId> … | --all | --current' };
+      }
+      return callTool(sessionId, 'chrome_close_windows', args);
+    }
+    case 'state': {
+      const id = Number(rest[1]);
+      const state = rest[2];
+      if (isNaN(id) || !state) return { ok: false, text: 'usage: window state <windowId> <normal|minimized|maximized|fullscreen>' };
+      return callTool(sessionId, 'chrome_manage_window', { windowId: id, state });
+    }
+    case 'resize': {
+      const id = Number(rest[1]);
+      if (isNaN(id) || !flags.w || !flags.h) return { ok: false, text: 'usage: window resize <windowId> --w <width> --h <height>' };
+      return callTool(sessionId, 'chrome_manage_window', { windowId: id, width: Number(flags.w), height: Number(flags.h) });
+    }
+    case 'focus': {
+      const id = Number(rest[1]);
+      if (isNaN(id)) return { ok: false, text: 'usage: window focus <windowId>' };
+      return callTool(sessionId, 'chrome_manage_window', { windowId: id, focused: true });
+    }
+    case 'arrange': {
+      const args = {};
+      if (flags.layout) args.layout = flags.layout;
+      if (flags.window) args.windowIds = idsFrom([flags.window]);
+      return callTool(sessionId, 'chrome_arrange_windows', args);
+    }
+    case 'list': {
+      return callTool(sessionId, 'get_windows_and_tabs', {});
+    }
+    default:
+      return { ok: false, text: 'window subcommands: new <url…>, close <ids…|--all|--current>, state <id> <state>, resize <id> --w --h, focus <id>, arrange [--layout grid|vertical|horizontal|cascade] [--window ids], list' };
+  }
+}
+
+async function cmdZoom(sessionId, flags, arg) {
+  const args = Object.assign({}, tabArg(flags));
+  if (!arg) return callTool(sessionId, 'chrome_zoom', args);
+  if (arg === 'in') args.zoomIn = true;
+  else if (arg === 'out') args.zoomOut = true;
+  else if (arg === 'reset') args.reset = true;
+  else {
+    const f = Number(arg);
+    if (isNaN(f)) return { ok: false, text: 'usage: zoom [<factor>|in|out|reset] [--tab <id>]' };
+    args.factor = f;
+  }
+  return callTool(sessionId, 'chrome_zoom', args);
+}
+
+async function cmdCookies(sessionId, flags, rest) {
+  const sub = rest[0] || 'list';
+  const url = rest[1];
+  const name = rest[2];
+  const value = rest.slice(3).join(' ');
+  const args = {};
+  switch (sub) {
+    case 'list':
+      if (!url) return { ok: false, text: 'usage: cookies list <url> [--domain D]' };
+      args.action = 'getAll';
+      args.url = url;
+      if (flags.domain) args.domain = flags.domain;
+      break;
+    case 'get':
+      if (!url || !name) return { ok: false, text: 'usage: cookies get <url> <name>' };
+      args.action = 'get';
+      args.url = url;
+      args.name = name;
+      break;
+    case 'set':
+      if (!url || !name || !value) return { ok: false, text: 'usage: cookies set <url> <name> <value> [--secure] [--httpOnly]' };
+      args.action = 'set';
+      args.url = url;
+      args.name = name;
+      args.value = value;
+      if (flags.secure) args.secure = true;
+      if (flags.httpOnly) args.httpOnly = true;
+      if (flags.path) args.path = flags.path;
+      if (flags.domain) args.domain = flags.domain;
+      break;
+    case 'delete':
+      if (!url || !name) return { ok: false, text: 'usage: cookies delete <url> <name>' };
+      args.action = 'delete';
+      args.url = url;
+      args.name = name;
+      break;
+    case 'clear':
+      if (!url) return { ok: false, text: 'usage: cookies clear <url>' };
+      args.action = 'deleteAll';
+      args.url = url;
+      break;
+    default:
+      return { ok: false, text: 'cookies subcommands: list <url>, get <url> <name>, set <url> <name> <value>, delete <url> <name>, clear <url>' };
+  }
+  return callTool(sessionId, 'chrome_cookies', args);
+}
+
+async function cmdDownloads(sessionId, flags, rest) {
+  const sub = rest[0] || 'list';
+  const ids = idsFrom(rest.slice(1));
+  const args = { action: sub };
+  if (ids.length) args.ids = ids;
+  if (sub === 'list') {
+    if (flags.query) args.query = flags.query;
+    if (flags.limit) args.limit = Number(flags.limit);
+  }
+  return callTool(sessionId, 'chrome_downloads', args);
+}
+
+async function cmdTrace(sessionId, flags, rest) {
+  const sub = rest[0] || 'stop';
+  switch (sub) {
+    case 'start': {
+      const args = Object.assign({}, tabArg(flags));
+      if (flags.reload) args.reload = true;
+      if (flags.auto) args.autoStop = true;
+      if (flags.duration) args.durationMs = Number(flags.duration);
+      if (flags.name) args.name = flags.name;
+      return callTool(sessionId, 'performance_start_trace', args);
+    }
+    case 'stop': {
+      const args = {};
+      if (flags.noSave) args.saveToDownloads = false;
+      if (flags.name) args.filenamePrefix = flags.name;
+      const r = await callTool(sessionId, 'performance_stop_trace', args);
+      // Strip giant base64 from the human-readable output.
+      if (!flags.json && r.ok) {
+        try {
+          const parsed = JSON.parse(r.text);
+          delete parsed.base64;
+          r.text = JSON.stringify(parsed, null, 2);
+        } catch (e) { /* leave as-is */ }
+      }
+      return r;
+    }
+    case 'analyze':
+      return callTool(sessionId, 'performance_analyze_insight', {});
+    default:
+      return { ok: false, text: 'trace subcommands: start [--reload] [--auto] [--duration MS] [--name X], stop [--no-save] [--name PREFIX], analyze' };
+  }
+}
+
+async function cmdGif(sessionId, flags, rest) {
+  const sub = rest[0] || 'status';
+  const args = { action: sub };
+  if (sub === 'start' || sub === 'auto_start') {
+    if (flags.fps) args.fps = Number(flags.fps);
+    Object.assign(args, tabArg(flags));
+  }
+  if (sub === 'stop') {
+    if (flags.noSave) args.save = false;
+    if (flags.base64 || flags.out) args.includeBase64 = true;
+    const r = await callTool(sessionId, 'chrome_gif_recorder', args);
+    if (!flags.json && r.ok) {
+      try {
+        const parsed = JSON.parse(r.text);
+        if (flags.out && parsed.base64) {
+          fs.writeFileSync(flags.out, Buffer.from(parsed.base64, 'base64'));
+          return { ok: true, saved: flags.out, frames: parsed.frames, size: parsed.size, bytes: Buffer.byteLength(parsed.base64, 'base64') };
+        }
+        delete parsed.base64;
+        delete parsed.markdown;
+        r.text = JSON.stringify(parsed, null, 2);
+      } catch (e) { /* leave as-is */ }
+    }
+    return r;
+  }
+  return callTool(sessionId, 'chrome_gif_recorder', args);
+}
+
 async function cmdRead(sessionId, flags) {
   const args = Object.assign({}, tabArg(flags));
   if (flags.interactive) args.filter = 'interactive';
-  if (flags.depth !== undefined) args.depth = flags.depth;
+  if (flags.depth !== undefined) args.depth = Number(flags.depth);
   if (flags.ref) args.refId = flags.ref;
   return callTool(sessionId, 'chrome_read_page', args);
 }
@@ -244,9 +583,14 @@ async function cmdKeys(sessionId, flags, keys) {
 }
 
 async function cmdNav(sessionId, flags, target) {
-  if (target === 'reload') return callTool(sessionId, 'chrome_navigate', Object.assign({ refresh: true, background: true }, tabArg(flags)));
-  const url = (target === 'back' || target === 'forward') ? target : target;
-  return callTool(sessionId, 'chrome_navigate', Object.assign({ url }, tabArg(flags)));
+  const args = Object.assign({}, tabArg(flags));
+  if (target === 'reload') return callTool(sessionId, 'chrome_navigate', Object.assign({ refresh: true, background: true }, args));
+  if (flags.newTab) {
+    args.url = target;
+    args.newTab = true;
+    return callTool(sessionId, 'chrome_navigate', args);
+  }
+  return callTool(sessionId, 'chrome_navigate', Object.assign({ url: target }, args));
 }
 
 async function cmdShot(sessionId, flags) {
@@ -314,19 +658,41 @@ async function repl(sessionId, flags) {
         const parts = line.split(/\s+/);
         const cmd = parts[0];
         const rest = line.slice(cmd.length).trim();
+        const words = rest.split(/\s+/);
         let out;
         if (cmd === 'tabs') out = await cmdTabs(sessionId, flags);
         else if (cmd === 'active') out = await cmdActive(sessionId, flags);
         else if (cmd === 'read') { const f = { ...flags, interactive: /--interactive/.test(rest) }; out = await cmdRead(sessionId, f); }
         else if (cmd === 'eval') out = await cmdEval(sessionId, flags, rest);
         else if (cmd === 'run') out = await cmdRun(sessionId, flags, rest);
-        else if (cmd === 'click') out = await cmdClick(sessionId, flags, rest.split(/\s+/)[0]);
+        else if (cmd === 'click') out = await cmdClick(sessionId, flags, words[0]);
         else if (cmd === 'fill') { const m = rest.match(/^(\S+)\s+([\s\S]+)$/); out = m ? await cmdFill(sessionId, flags, m[1], m[2]) : { ok: false, text: 'usage: fill <sel|ref> <value>' }; }
         else if (cmd === 'keys') out = await cmdKeys(sessionId, flags, rest);
-        else if (cmd === 'nav') out = await cmdNav(sessionId, flags, rest);
+        else if (cmd === 'nav') out = await cmdNav(sessionId, flags, words[0] || 'reload');
         else if (cmd === 'shot') out = await cmdShot(sessionId, flags);
         else if (cmd === 'storage') out = await cmdStorage(sessionId, flags);
         else if (cmd === 'status') out = await cmdStatus(sessionId, flags);
+        else if (cmd === 'open') out = await cmdOpen(sessionId, flags, words);
+        else if (cmd === 'close') out = await cmdClose(sessionId, flags, words);
+        else if (cmd === 'dup') out = await cmdDup(sessionId, flags, idsFrom(words));
+        else if (cmd === 'reload') out = await cmdReload(sessionId, flags, idsFrom(words));
+        else if (cmd === 'discard') out = await cmdDiscard(sessionId, flags, idsFrom(words));
+        else if (cmd === 'pin') out = await cmdPinUnpin(sessionId, flags, idsFrom(words), 'pin');
+        else if (cmd === 'unpin') out = await cmdPinUnpin(sessionId, flags, idsFrom(words), 'unpin');
+        else if (cmd === 'mute') out = await cmdMuteUnmute(sessionId, flags, idsFrom(words), 'mute');
+        else if (cmd === 'unmute') out = await cmdMuteUnmute(sessionId, flags, idsFrom(words), 'unmute');
+        else if (cmd === 'move') out = await cmdMove(sessionId, flags, idsFrom(words));
+        else if (cmd === 'group') out = await cmdGroup(sessionId, flags, idsFrom(words));
+        else if (cmd === 'ungroup') out = await cmdUngroup(sessionId, flags, idsFrom(words));
+        else if (cmd === 'groups') out = await cmdGroups(sessionId, flags);
+        else if (cmd === 'search') out = await cmdSearch(sessionId, flags, rest);
+        else if (cmd === 'content-search') out = await cmdContentSearch(sessionId, flags, rest);
+        else if (cmd === 'window') out = await cmdWindow(sessionId, flags, words);
+        else if (cmd === 'zoom') out = await cmdZoom(sessionId, flags, words[0]);
+        else if (cmd === 'cookies') out = await cmdCookies(sessionId, flags, words);
+        else if (cmd === 'downloads') out = await cmdDownloads(sessionId, flags, words);
+        else if (cmd === 'trace') out = await cmdTrace(sessionId, flags, words);
+        else if (cmd === 'gif') out = await cmdGif(sessionId, flags, words);
         else if (cmd === 'help') { console.log(USAGE); return; }
         else out = { ok: false, text: 'unknown command: ' + cmd + ' (try: help)' };
         printOut(out, false);
@@ -345,25 +711,41 @@ const USAGE = `mcp — mcp-chrome-bridge CLI
 
 Usage: node scripts/mcp.js <command> [args] [--json] [--tab <id>]
 
-Commands:
-  status                 Bridge health + host PID
-  restart                Kill stuck host, wait for respawn
-  tabs                   List windows and tabs
-  active                 Active tab info
+Tabs & windows:
+  open <url> [url2 …]    Open new tab(s): --bg --pin --window <id> --index N
+  close <targets>        ids | url:<u> | domain:<d> | all | others [--keep ids] | window <ids>
+  dup <ids>              Duplicate tab(s)
+  reload [ids|--all] [--cache]
+  discard [ids|--all]    Suspend tabs to free memory
+  pin|unpin <ids>        Pin/unpin tab(s)
+  mute|unmute <ids>      Mute/unmute tab(s)
+  move <ids>             --window <id> --index N
+  group <ids>            --name X --color C   | ungroup <ids> | groups
+  search <query>         Find tabs by title/URL/host
+  content-search <query> Search text inside open tabs
+  window                 new|close|state|resize|focus|arrange|list (see "mcp window help")
+  zoom [f|in|out|reset]  Tab zoom factor (0.25–5)
   switch <tabId>         Switch to tab
+  tabs | active          List windows/tabs / active tab
+
+Cookies & downloads:
+  cookies                list <url> | get <url> <name> | set <url> <name> <value> | delete <url> <name> | clear <url>
+  downloads              list [--query Q] | cancel|pause|resume|erase <ids> | open|show <id>
+
+Recording & tracing:
+  trace                  start [--reload] [--auto] [--duration MS] | stop [--no-save] | analyze
+  gif                    start [--fps N] [--auto] | stop [--base64] [--out file.gif] | status | capture | export
+
+Page interaction:
   read [--interactive] [--depth N] [--ref ref_X]
-  eval '<js>'            Run JS expression
-  run '<js>'             Run JS block (async body; must return)
-  click <sel|ref>        Click element
-  fill <sel|ref> <value> Fill form value
-  keys '<keys>'          Simulate keys
-  nav <url|back|forward|reload>
+  eval '<js>' | run '<js>'
+  click <sel|ref> | fill <sel|ref> <value> | keys '<keys>'
+  nav <url|back|forward|reload> [--new-tab]
   shot [--full] [--out file.png]
-  tools                  List bridge tools
-  call <tool> '{"args":…}'  Raw tool call
   storage                Dump browser storage
-  repl                   Interactive session
-  help`;
+
+Misc:
+  status | restart | tools | call <tool> '{"args":…}' | repl | help`;
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -383,6 +765,27 @@ async function main() {
       case 'tabs': out = await cmdTabs(sessionId, flags); break;
       case 'active': out = await cmdActive(sessionId, flags); break;
       case 'switch': out = await callTool(sessionId, 'chrome_switch_tab', { tabId: parseInt(rest[0], 10) }); break;
+      case 'open': out = await cmdOpen(sessionId, flags, rest); break;
+      case 'close': out = await cmdClose(sessionId, flags, rest); break;
+      case 'dup': out = await cmdDup(sessionId, flags, idsFrom(rest)); break;
+      case 'reload': out = await cmdReload(sessionId, flags, idsFrom(rest)); break;
+      case 'discard': out = await cmdDiscard(sessionId, flags, idsFrom(rest)); break;
+      case 'pin': out = await cmdPinUnpin(sessionId, flags, idsFrom(rest), 'pin'); break;
+      case 'unpin': out = await cmdPinUnpin(sessionId, flags, idsFrom(rest), 'unpin'); break;
+      case 'mute': out = await cmdMuteUnmute(sessionId, flags, idsFrom(rest), 'mute'); break;
+      case 'unmute': out = await cmdMuteUnmute(sessionId, flags, idsFrom(rest), 'unmute'); break;
+      case 'move': out = await cmdMove(sessionId, flags, idsFrom(rest)); break;
+      case 'group': out = await cmdGroup(sessionId, flags, idsFrom(rest)); break;
+      case 'ungroup': out = await cmdUngroup(sessionId, flags, idsFrom(rest)); break;
+      case 'groups': out = await cmdGroups(sessionId, flags); break;
+      case 'search': out = await cmdSearch(sessionId, flags, rest.join(' ')); break;
+      case 'content-search': out = await cmdContentSearch(sessionId, flags, rest.join(' ')); break;
+      case 'window': out = await cmdWindow(sessionId, flags, rest); break;
+      case 'zoom': out = await cmdZoom(sessionId, flags, rest[0]); break;
+      case 'cookies': out = await cmdCookies(sessionId, flags, rest); break;
+      case 'downloads': out = await cmdDownloads(sessionId, flags, rest); break;
+      case 'trace': out = await cmdTrace(sessionId, flags, rest); break;
+      case 'gif': out = await cmdGif(sessionId, flags, rest); break;
       case 'read': out = await cmdRead(sessionId, flags); break;
       case 'eval': out = await cmdEval(sessionId, flags, rest.join(' ')); break;
       case 'run': out = await cmdRun(sessionId, flags, rest.join(' ')); break;

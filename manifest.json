@@ -7,6 +7,7 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwSxV42ERPVsFALFuJiCBsGggfU1ORE5e2NIT4aeom6BK9Ttiw9cuLp6PwGWPqJ5aYRjhp30veS13PFa/9kAfJ6FhdR0AqqkLdINNaBRoQUpXN4VvPq9WFssIVvEhfwPpa8GcmFPrvq8vhC6X2uotyiUmpasMtyOv/9nvJ6wUnmSJEIpV6SUdqZqejuBk+URNX/Q15E+vdNdqtMR+a6GbOg5W53IYm8xzJI21tNrEfMEbQT3VLaLWfuDiem20ghHU1O8SAMJiz7YklKE4hwqYEiXnSnYcy2RGkJ6oMM/fleV7jnAWpTMPRoEeOgqJuyS3VdrZLViPtrslWwdQW6vMiQIDAQAB",
   "permissions": [
     "tabs",
+    "tabGroups",
     "activeTab",
     "scripting",
     "webRequest",
@@ -14,8 +15,10 @@
     "downloads",
     "history",
     "bookmarks",
+    "cookies",
     "storage",
     "alarms",
+    "system.display",
     "nativeMessaging"
   ],
   "host_permissions": ["<all_urls>"],

@@ -60,18 +60,26 @@ background.js          Service worker: native-messaging client + tool dispatcher
 lib/
   protocol.js          Wire-protocol constants, tool registry, result helpers
   cdp.js               chrome.debugger promisified helpers (CDP eval, capture)
-  tabs.js              Tab resolution + executeScript injection helpers
+  tabs.js              Tab resolution + multi-tab id resolution helpers
+  gif-encoder.js       Dependency-free GIF89a encoder (median cut + LZW)
+  published-tools.js   Descriptors exposing new tools to MCP clients (flow.*)
 tools/
-  browser.js           get_windows_and_tabs, chrome_navigate/switch_tab/close_tabs
+  browser.js           Tab toolkit: open/duplicate/reload/discard/pin/mute/move,
+                       groups, search, details, extended close + navigation
+  windows.js           New/close/manage/arrange windows + tab zoom
   content.js           chrome_get_web_content, chrome_get_interactive_elements
   interaction.js       chrome_click_element/fill_or_select/keyboard/javascript
   network.js           chrome_network_request + chrome_network_capture
   screenshot.js        chrome_screenshot (viewport, full-page, element via CDP)
   console.js           chrome_console (buffer from content script)
   data.js              chrome_history, chrome_bookmark_*
+  data-ext.js          chrome_cookies, chrome_downloads, cross-tab content search
+  perf.js              Real CDP performance tracing (start/stop/analyze)
+  gif.js               Animated GIF recorder (fixed-FPS + action-driven)
+  flows.js             record_replay_flow_run dispatcher for published tools
   inject.js            chrome_inject_script, chrome_send_command_to_inject_script
-  misc.js              chrome_read_page, chrome_computer (subset), dialogs,
-                       downloads, uploads, element selection
+  misc.js              chrome_read_page, chrome_computer, dialogs, uploads,
+                       element selection
 content/
   console-capture.js   document_start content script that buffers console
   console-capture-main.js  same, running in the MAIN world
@@ -84,8 +92,12 @@ scripts/
   register-host.js     Adds this extension's ID to the native host allowed_origins
   mcp.js / mcp-cli.js  Legacy in-repo CLI (superseded by app/mcpctl.js)
   mcp-batch.js         Batch runner for the legacy CLI
+  build-exe.js         Builds dist/mcp.exe from scripts/mcp.js via Node SEA
   host-roundtrip-test.js / live-feature-test.js / unit-sim-console.js
                        Test harnesses (native host round-trip, live tools, sim console)
+  test-gif-encoder.js  Unit tests for the GIF encoder (structure + LZW round-trip)
+  probe-cdp.js         Diagnostic: exercises trace + GIF recorder directly and
+                       dumps raw MCP responses (also self-heals a wedged host)
 ```
 
 ## Install
@@ -141,8 +153,11 @@ extension (reverse-engineered from the installed `mcp-chrome-bridge` package):
   `{responseToRequestId, payload:{status:"success", data}}` where `data` is an
   MCP result (`{content:[{type:"text",text}]}`), or
   `{responseToRequestId, payload:{status:"error", error:"…"}}`.
-- `rr_list_published_flows` is answered with an empty item list (this build has
-  no recorded-flow tools).
+- `rr_list_published_flows` is answered with the descriptors in
+  `lib/published-tools.js` — this is how MCP clients discover the tab/window
+  toolkit (each item shows up as a `flow.<slug>` dynamic tool). Calls to those
+  tools are proxied back as `record_replay_flow_run` and dispatched to the real
+  tool by `tools/flows.js`.
 - Liveness: the worker pings the host (`ping_from_extension`) via a keepalive
   alarm every 30 s, and reconnects with **unlimited** retries via a
   `bridge-reconnect` alarm (service-worker-safe — a busy service worker could
@@ -150,36 +165,53 @@ extension (reverse-engineered from the installed `mcp-chrome-bridge` package):
 
 ## Tools
 
-Browser: `get_windows_and_tabs`, `chrome_navigate`, `chrome_switch_tab`,
-`chrome_close_tabs`, `chrome_go_back_or_forward`.
+**Tabs** — `get_windows_and_tabs`, `chrome_open_tabs` (one or many URLs, active /
+background / pinned / window / index), `chrome_duplicate_tabs`,
+`chrome_reload_tabs` (optionally bypassing the cache), `chrome_discard_tabs`
+(suspend), `chrome_pin_tabs` / `chrome_unpin_tabs`, `chrome_mute_tabs` /
+`chrome_unmute_tabs`, `chrome_move_tabs` (reorder or move between windows),
+`chrome_group_tabs` / `chrome_ungroup_tabs` / `chrome_tab_groups`,
+`chrome_search_tabs` (by title/URL/host), `chrome_tab_details`,
+`chrome_close_tabs` (ids, URL, domain, whole windows, `all`, `allExcept`),
+`chrome_switch_tab`, `chrome_go_back_or_forward`, `chrome_navigate` (plus
+`newTab` to open in a new tab).
 
-Content: `chrome_get_web_content`, `chrome_get_interactive_elements`,
-`chrome_read_page` (ref-based element tree for click/fill targeting).
+**Windows** — `chrome_new_window` (urls, incognito, size, state),
+`chrome_close_windows`, `chrome_manage_window` (minimize/maximize/fullscreen/
+focus/resize/move), `chrome_arrange_windows` (tile in a grid, vertical,
+horizontal, or cascade on the primary display), `chrome_zoom` (get/set/reset a
+tab's zoom factor).
 
-Interaction: `chrome_click_element`, `chrome_fill_or_select`, `chrome_keyboard`,
-`chrome_javascript` (async JS in the page via CDP with executeScript fallback),
-`chrome_computer` (screenshot / click / type / key / scroll / scroll_to / wait /
-resize_page / hover / fill / fill_form subset).
+**Content & interaction** — `chrome_get_web_content`,
+`chrome_get_interactive_elements`, `chrome_read_page` (ref-based element tree),
+`chrome_click_element`, `chrome_fill_or_select`, `chrome_keyboard`,
+`chrome_javascript`, `chrome_computer` (screenshot / click / type / key /
+scroll / scroll_to / wait / resize_page / hover / fill / fill_form subset),
+`chrome_search_tabs_content` (search the visible text of open tabs).
 
-Network: `chrome_network_request` (page-context fetch with cookies),
+**Network** — `chrome_network_request` (page-context fetch with cookies),
 `chrome_network_capture` (start/stop; webRequest entries, optional response
 bodies via the debugger API).
 
-Media: `chrome_screenshot` (viewport via `captureVisibleTab`; full-page and
-element captures via CDP; optional save-to-downloads or base64).
+**Media & performance** — `chrome_screenshot` (viewport via
+`captureVisibleTab`; full-page and element captures via CDP),
+`chrome_gif_recorder` (record a tab as an animated GIF: fixed-FPS or
+action-driven auto-capture, then stop/export; `stop` returns metadata by
+default — pass `includeBase64:true` to get the GIF data inline, which is
+trimmed automatically if it would exceed the native host's 16MB per-message
+cap), `performance_start_trace` / `performance_stop_trace` /
+`performance_analyze_insight` (real CDP tracing with trace JSON export and
+summaries).
 
-Data: `chrome_history`, `chrome_bookmark_search`, `chrome_bookmark_add`,
-`chrome_bookmark_delete`.
+**Data** — `chrome_history`, `chrome_bookmark_search`, `chrome_bookmark_add`,
+`chrome_bookmark_delete`, `chrome_cookies` (get/getAll/set/delete/deleteAll),
+`chrome_downloads` (list/cancel/pause/resume/erase/open/show/removeFile).
 
-Injection: `chrome_inject_script`, `chrome_send_command_to_inject_script`.
-
-Misc: `chrome_console` (snapshot/buffer), `chrome_handle_dialog`,
-`chrome_handle_download`, `chrome_upload_file` (CDP file input),
-`chrome_request_element_selection` (click-to-pick overlay).
-
-Not implemented in this build (return clean errors): `chrome_gif_recorder`,
-`performance_start_trace`, `performance_stop_trace`,
-`performance_analyze_insight`.
+**Injection & misc** — `chrome_inject_script`,
+`chrome_send_command_to_inject_script`, `chrome_console` (snapshot/buffer),
+`chrome_handle_dialog`, `chrome_handle_download`, `chrome_upload_file` (CDP
+file input), `chrome_request_element_selection` (click-to-pick overlay),
+`record_replay_flow_run` (flow.* dispatcher).
 
 ## Standalone CLI (`app/mcpctl`)
 
@@ -231,21 +263,76 @@ Global flags: `--json`, `--tab <id>`, `--port <n>`, `--host <h>`,
 
 The original single-command CLI (`mcp` launcher: `scripts/mcp.js`, `mcp.cmd`,
 bash `mcp`, or `npm link`). Superseded by `app/mcpctl` but still functional;
-uses the same host-recovery and session-cleanup logic.
+uses the same host-recovery and session-cleanup logic. It can also be compiled
+to a standalone `dist/mcp.exe` with `node scripts/build-exe.js`.
 
 ```bash
 mcp status                # bridge health + host PID
 mcp restart               # kill stuck host, wait for respawn
-mcp tabs / mcp active / mcp switch <tabId>
+mcp tabs                  # windows + tabs
+mcp active                # active tab
+mcp switch <tabId>
+
+# ---- full tab management ----
+mcp open 'https://a.com' 'https://b.com'   # one or many new tabs
+mcp open 'https://…' --bg --pin --window 3  # background/pinned/window
+mcp close 12 13          # close tabs by id
+mcp close url:https://x  # close by exact URL
+mcp close domain:github.com
+mcp close others         # close every tab except the active one
+mcp close all            # close every tab in every window
+mcp close window 4       # close whole window(s)
+mcp dup 12               # duplicate tab(s)
+mcp reload --all --cache # reload everything, bypass cache
+mcp discard 12           # suspend a tab
+mcp pin 12 | mcp unpin 12
+mcp mute 12 | mcp unmute 12
+mcp move 12 13 --window 4 --index 0
+mcp group 12 13 --name Work --color blue
+mcp ungroup 12 | mcp groups
+mcp search 'github'      # find tabs by title/url/host
+mcp content-search 'token expired'  # search text inside open tabs
+
+# ---- windows ----
+mcp window new 'https://…' --incognito --w 1200 --h 800
+mcp window close 4 --current --all
+mcp window state 4 fullscreen
+mcp window resize 4 --w 1280 --h 720
+mcp window focus 4
+mcp window arrange --layout grid
+mcp zoom 1.5 | mcp zoom reset
+
+# ---- cookies & downloads ----
+mcp cookies list 'https://example.com'
+mcp cookies set 'https://example.com' theme dark --httpOnly
+mcp cookies delete 'https://example.com' theme
+mcp downloads list --query report
+mcp downloads cancel 12
+
+# ---- recording & tracing ----
+mcp gif start --fps 5 | mcp gif status | mcp gif stop
+mcp gif start --auto     # capture a frame after every tool action
+mcp gif stop --out clip.gif   # save the recording to a file
+mcp gif stop --base64    # also print the GIF data inline
+mcp trace start --reload --auto --duration 8000
+mcp trace stop --name page-load | mcp trace analyze
+
+# ---- page interaction ----
 mcp read --interactive    # interactive elements with ref_ ids
 mcp eval 'document.title' # run JS expression in the page
 mcp run 'return 1+1'      # run a JS block (async body, must return)
 mcp click '#button'       # or ref_12
 mcp fill 'input' 'value'
 mcp keys 'Enter'
-mcp nav 'https://…'       # url | back | forward | reload
+mcp nav 'https://…'       # url | back | forward | reload (--new-tab)
 mcp shot --full --out page.png
-mcp tools / mcp call <tool> '{"k":1}' / mcp storage / mcp repl / mcp help
+
+mcp tools                 # list bridge tools (incl. flow.* published tools)
+mcp call <tool> '{"k":1}' # raw tool call
+mcp storage               # localStorage/sessionStorage/cookies/IndexedDB
+
+mcp repl                  # interactive session (single persistent MCP session)
+mcp help
 ```
 
 Flags: `--json`, `--tab <id>`, `--depth N`, `--ref ref_X`, `--out file.png`.
@@ -254,7 +341,22 @@ Flags: `--json`, `--tab <id>`, `--depth N`, `--ref ref_X`, `--out file.png`.
 
 - Regenerate icons: `node scripts/make-icons.js`
 - Re-run host registration dry-run: `node scripts/register-host.js`
-- Host round-trip test: `node scripts/host-roundtrip-test.js`
-- Live tool smoke test: `node scripts/live-feature-test.js`
+- Unit tests (no browser needed):
+  - `node scripts/test-gif-encoder.js` — GIF encoder structure + bit-exact LZW
+    round-trip across all code-size transitions and dictionary resets
+  - `node scripts/unit-sim-console.js` — console-capture relay chain
+- Live end-to-end tests (need the bridge running + extension connected):
+  - `node scripts/live-feature-test.js` — baseline tools (content, JS, console,
+    network, fill, click)
+  - `node scripts/live-tabs-test.js` — new tab/window toolkit: open, search,
+    details, pin/unpin, mute/unmute, duplicate, groups, move, zoom, reload,
+    content-search, cookies, downloads, window manage/arrange, trace, GIF.
+    It only touches tabs/windows it creates and cleans up after itself.
+  - `node scripts/probe-cdp.js` — focused diagnostic for the trace + GIF
+    CDP paths; dumps raw responses and always closes its MCP session
+- Build the standalone CLI executables:
+  - `node app/build.js` — produces `app/dist/mcpctl.exe` (standalone CLI)
+  - `node scripts/build-exe.js --run` — produces `dist/mcp.exe` from the legacy
+    `scripts/mcp.js` CLI (same SEA technique; `dist/` is git-ignored)
 - There is no build step for the extension — plain JS (MV3 service worker with
   `importScripts`). Reload it from `chrome://extensions` after edits.

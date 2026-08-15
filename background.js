@@ -5,6 +5,8 @@ importScripts(
   'lib/protocol.js',
   'lib/cdp.js',
   'lib/tabs.js',
+  'lib/gif-encoder.js',
+  'lib/published-tools.js',
   'tools/browser.js',
   'tools/content.js',
   'tools/interaction.js',
@@ -12,7 +14,12 @@ importScripts(
   'tools/screenshot.js',
   'tools/console.js',
   'tools/data.js',
+  'tools/data-ext.js',
+  'tools/windows.js',
+  'tools/perf.js',
+  'tools/gif.js',
   'tools/inject.js',
+  'tools/flows.js',
   'tools/misc.js'
 );
 
@@ -98,8 +105,12 @@ function onNativeMessage(msg) {
       handleToolCall(msg);
       break;
     case 'rr_list_published_flows':
-      // MCP server discovers dynamic flow tools via the extension; none in clean-room build
-      replyToHost(msg.requestId, { status: 'success', items: [] });
+      // MCP server discovers extension-defined tools via this handshake. We
+      // publish the tab/window toolkit so clients see them as flow.<slug> tools.
+      replyToHost(msg.requestId, {
+        status: 'success',
+        items: (globalThis.PUBLISHED_TOOLS || []).map(({ tool, ...rest }) => rest),
+      });
       break;
     case 'request_data':
       replyToHost(msg.requestId, { status: 'error', error: 'request_data not supported' });
@@ -119,6 +130,11 @@ async function handleToolCall(msg) {
     if (!tool) throw new Error(`Unknown tool: ${name}`);
     const result = await tool(args);
     replyToHost(requestId, { status: 'success', data: result });
+    // GIF auto-capture hook: in action-driven recording mode, a frame is taken
+    // after every successful tool call. Fire-and-forget so responses stay fast.
+    try {
+      if (globalThis.gifAutoCaptureHook) globalThis.gifAutoCaptureHook().catch(() => {});
+    } catch (e) { /* ignore */ }
   } catch (e) {
     replyToHost(requestId, { status: 'error', error: String(e.message || e) });
   }
@@ -127,6 +143,21 @@ async function handleToolCall(msg) {
 function replyToHost(requestId, payload) {
   if (!port) return;
   try {
+    // The native host (mcp-chrome-bridge) silently DROPS any single message over
+    // its 16MB receive cap (MAX_MESSAGE_SIZE_BYTES). Detect that up front and
+    // surface a clear error instead of a response that never arrives.
+    const sizeBytes = JSON.stringify({ responseToRequestId: requestId, payload }).length;
+    if (sizeBytes > 14 * 1024 * 1024) {
+      const mb = Math.round(sizeBytes / 1024 / 1024);
+      port.postMessage({
+        responseToRequestId: requestId,
+        payload: {
+          status: 'error',
+          error: `Tool result too large (${mb}MB) — the native host caps messages at 16MB. Retry with inline base64/JSON disabled (e.g. includeBase64:false, save:true).`,
+        },
+      });
+      return;
+    }
     port.postMessage({ responseToRequestId: requestId, payload });
   } catch (e) { /* ignore */ }
 }
