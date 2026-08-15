@@ -27,24 +27,50 @@ function run(cmd, opts = {}) {
   return execSync(cmd, { cwd: root, stdio: 'inherit', ...opts });
 }
 
+// Zero out + truncate the PE certificate table so postject doesn't leave the
+// Authenticode signature broken (Windows refuses to load binaries with a
+// corrupted signature; the exe is unsigned anyway). Mirrors app/build.js.
+function unsign(file) {
+  let b = fs.readFileSync(file);
+  const pe = b.readUInt32LE(0x3c);
+  if (b.toString('ascii', pe, pe + 4) !== 'PE\x00\x00') throw new Error('not a PE file: ' + file);
+  const magic = b.readUInt16LE(pe + 24); // 0x10b = PE32, 0x20b = PE32+
+  const ddBase = magic === 0x20b ? pe + 24 + 112 : pe + 24 + 96;
+  const sec = ddBase + 4 * 8; // IMAGE_DIRECTORY_ENTRY_SECURITY = 4
+  const va = b.readUInt32LE(sec);
+  const sz = b.readUInt32LE(sec + 4);
+  if (va !== 0 || sz !== 0) {
+    if (va > 0 && va <= b.length) b = b.slice(0, va); // drop the certificate data
+    b.writeUInt32LE(0, sec);
+    b.writeUInt32LE(0, sec + 4);
+    fs.writeFileSync(file, b);
+    console.log('  signature removed (cert table @0x' + va.toString(16) + ', ' + sz + ' bytes)');
+  } else {
+    console.log('  no Authenticode signature present');
+  }
+}
+
 function step(name) {
   console.log(`\n== ${name} ==`);
 }
 
 try {
-  step('1/4 — generate SEA blob (sea-config.json -> dist/sea-prep.blob)');
+  step('1/5 — generate SEA blob (sea-config.json -> dist/sea-prep.blob)');
   fs.mkdirSync(dist, { recursive: true });
   run(`node --experimental-sea-config sea-config.json`);
 
-  step('2/4 — copy node.exe -> dist/mcp.exe');
+  step('2/5 — copy node.exe -> dist/mcp.exe');
   if (!fs.existsSync(nodeExe)) throw new Error('cannot locate node.exe: ' + nodeExe);
   fs.copyFileSync(nodeExe, exe);
   console.log('copied ' + nodeExe + ' -> ' + exe);
 
-  step('3/4 — inject blob with postject');
+  step('3/5 — strip Authenticode signature');
+  unsign(exe);
+
+  step('4/5 — inject blob with postject');
   run(`npx --yes postject ${JSON.stringify(exe)} NODE_SEA_BLOB ${JSON.stringify(blob)} --sentinel-fuse ${FUSE}`);
 
-  step('4/4 — verify');
+  step('5/5 — verify');
   const size = fs.statSync(exe).size;
   console.log(`dist/mcp.exe built (${(size / 1024 / 1024).toFixed(1)} MB)`);
   if (process.argv.includes('--run')) {
