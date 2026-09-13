@@ -36,6 +36,19 @@
       </div>
     </section>
 
+    <section class="instance">
+      <span class="card-label">Instance (this browser)</span>
+      <div class="inst-row">
+        <code id="inst-id">…</code>
+        <span class="pill" id="inst-browser">…</span>
+      </div>
+      <div class="label-row">
+        <input id="label" type="text" maxlength="60" placeholder="label, e.g. chrome-work" autocomplete="off" />
+        <button id="label-btn">Save</button>
+      </div>
+      <span class="card-label hint">Each browser with the extension gets its own MCP port.</span>
+    </section>
+
     <section class="endpoint">
       <span class="card-label">Endpoint</span>
       <div class="endpoint-row">
@@ -48,6 +61,7 @@
     <section class="port-row">
       <label for="port">MCP port</label>
       <input id="port" type="number" min="1024" max="65535" value="12306" />
+      <button id="newport-btn" title="Move to the next free port (conflict resolution)">New port</button>
       <button id="connect-btn" class="primary">Connect</button>
       <button id="disconnect-btn">Disconnect</button>
     </section>

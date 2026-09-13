@@ -33,8 +33,36 @@ async function refresh() {
     $('endpoint').textContent = `http://127.0.0.1:${status.mcpPort}/mcp`;
   }
   if (status.hostName) $('ext-id').textContent = `host: ${status.hostName}`;
+  if (status.instanceId) {
+    $('inst-id').textContent = status.instanceId;
+    $('inst-id').title = `instanceId: ${status.instanceId}`;
+  }
+  if (status.browser) {
+    const b = status.browser;
+    $('inst-browser').textContent = `${b.name}${b.version ? ' ' + b.version : ''}${b.platform ? ' · ' + b.platform : ''}`;
+  }
+  if (status.label) $('label').value = status.label;
   return status;
 }
+
+$('label-btn').addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ type: 'bridge-set-label', label: $('label').value }).catch(() => null);
+  log(`instance label set to "${$('label').value}"`);
+});
+
+$('label').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('label-btn').click();
+});
+
+$('newport-btn').addEventListener('click', async () => {
+  const resp = await chrome.runtime.sendMessage({ type: 'bridge-next-port' }).catch(() => null);
+  if (resp) {
+    log(`moved to port ${resp.mcpPort} — reconnect in progress…`);
+  } else {
+    log('could not move port (background unreachable)', true);
+  }
+  refresh();
+});
 
 $('connect-btn').addEventListener('click', async () => {
   const port = parseInt($('port').value, 10) || 12306;

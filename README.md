@@ -59,6 +59,7 @@ manifest.json          MV3 manifest with pinned identity (key → stable ID)
 background.js          Service worker: native-messaging client + tool dispatcher
 lib/
   protocol.js          Wire-protocol constants, tool registry, result helpers
+  instance.js          Multi-browser identity (instanceId, label, own MCP port)
   cdp.js               chrome.debugger promisified helpers (CDP eval, capture)
   tabs.js              Tab resolution + executeScript injection helpers
 tools/
@@ -72,13 +73,15 @@ tools/
   inject.js            chrome_inject_script, chrome_send_command_to_inject_script
   misc.js              chrome_read_page, chrome_computer (subset), dialogs,
                        downloads, uploads, element selection
+  instance.js          bridge_get_instance_info (instance discovery tool)
 content/
   console-capture.js   document_start content script that buffers console
   console-capture-main.js  same, running in the MAIN world
 popup/                 Status + connect/disconnect UI
 app/
   mcpctl.js            Standalone CLI (zero deps) — full command list in app/README.md
-  build.js             Builds app/dist/mcpctl.exe via Node SEA + postject
+  build.js             Builds app/dist/mcpctl.exe via Node SEA + postject (default packaging)
+  build-launcher.js    Alternative packaging: a ~1 KB node launcher (mutually exclusive with the exe)
 scripts/
   make-icons.js        Generates the PNG icons (pure Node, no deps)
   register-host.js     Adds this extension's ID to the native host allowed_origins
@@ -126,6 +129,70 @@ node bridge-raw.js chrome_get_windows_and_tabs '{}'
 node bridge-raw.js chrome_navigate '{"url":"https://example.com"}'
 ```
 
+## Multi-browser (one bridge instance per browser)
+
+Load the same extension folder in **several browsers** (Chrome, Edge, Brave,
+Chromium, Opera) or several profiles, and each one becomes its own bridge
+instance with its own MCP port — no port fights, no cross-talk:
+
+- Each instance gets a **stable `instanceId`** (generated once, stored in
+  `chrome.storage.local`) and a **deterministic default port** in the
+  `12306–12335` range (hash of the instanceId), persisted once chosen so
+  restarts keep the same endpoint.
+- On a port collision (`EADDRINUSE` from another instance) the extension
+  automatically moves to the next free port instead of squatting on the wrong
+  browser's server — you never accidentally drive browser A while pointing at
+  browser B's endpoint.
+- Give instances friendly **labels** in the popup (e.g. `chrome-work`,
+  `edge-victim`) so you can target them by name.
+
+Discover and target instances with `mcpctl`:
+
+```bash
+mcpctl browsers                  # list every live browser + the selector to use for it
+mcpctl browsers --json           # same, machine-readable
+mcpctl browsers --range 12306-12340
+
+mcpctl --browser chrome status   # target one browser by name
+mcpctl --browser edge:12311 tabs # name pinned to a port (always unique)
+mcpctl --browser port:12311 eval 'document.title'
+mcpctl --browser id:3f2a1c9d tabs
+mcpctl --port 12311 shot --out edge.png
+
+mcpctl --browser edge label work # name that browser...
+mcpctl --browser work tabs       # ...then target it by name
+```
+
+`browsers` (alias `instances`, `list`) needs **no session and no lock**, so it
+still works when the CLI's own default port is down — which is exactly when you
+need to find the other browsers. It scans the range in parallel (~50 ms) and
+prints, for each live instance, the browser/version, its label, its
+`instanceId`, its endpoint, and the exact `--browser` selector to use.
+
+`--browser` accepts a label, `name:port`, `port:<n>`, `id:<prefix>` or a plain
+browser name. If a plain name matches several instances the CLI lists the
+candidates instead of guessing; if only one Chrome (say) is live, `--browser
+chrome` still resolves. `--port` always wins over `--browser`.
+
+Because the host serves a **singleton MCP session**, an instance whose session
+is currently held by another client (an IDE, or a parallel `mcpctl`) cannot be
+queried for its name. The CLI keeps a small identity cache in the temp dir
+keyed by port, so a busy instance is still listed and still targetable; and if
+the loaded extension is older than the CLI (no identity tool), `browsers` falls
+back to describing each instance by its tabs and tells you to reload the
+extension.
+
+Every browser that should run the bridge needs the native host registered for
+it (run `node scripts/register-host.js --apply` — it now covers Chrome,
+Chromium, **Microsoft Edge**, and the Brave variants), and the extension loaded
+in that browser with **Connect** pressed. `mcpctl browsers` only shows
+browsers that are actually running.
+
+Typical multi-browser workflows: race-condition testing with two sessions,
+role-A-vs-role-B acting as two users in separate browsers, simulating a victim
+browser for CSWSH / stored-XSS verification, or keeping your primary hunting
+browser clean while a second browser holds the authenticated session.
+
 ## Protocol
 
 The extension speaks the native-messaging protocol used by the official
@@ -147,8 +214,22 @@ extension (reverse-engineered from the installed `mcp-chrome-bridge` package):
   alarm every 30 s, and reconnects with **unlimited** retries via a
   `bridge-reconnect` alarm (service-worker-safe — a busy service worker could
   otherwise be idle-killed, which drops the native port and kills the host).
+- Ports: the extension asks the host to bind **its own** port (see
+  Multi-browser below). `EADDRINUSE` from the host is treated as a collision
+  with another instance and triggers an automatic move to the next free port,
+  not as "already running".
+- Identity: the extension registers a `bridge_get_instance_info` tool
+  (browser name/version, `instanceId`, label, own port) that the CLI uses for
+  instance discovery.
 
 ## Tools
+
+Instance: `bridge_get_instance_info` (multi-browser discovery — browser
+name/version, `instanceId`, label, own MCP port) and
+`bridge_set_instance_label` (name this browser from the CLI via
+`mcpctl [--browser <sel>] label <name>`, or from the popup). Both are dispatched
+through the host like any other tool; they are intentionally absent from
+`tools/list`, which the host builds from a static schema list.
 
 Browser: `get_windows_and_tabs`, `chrome_navigate`, `chrome_switch_tab`,
 `chrome_close_tabs`, `chrome_go_back_or_forward`.
@@ -195,6 +276,13 @@ node app/build.js
 app/dist/mcpctl.exe status
 ```
 
+Don't want to carry an 87 MB unsigned binary that AV heuristics may scan or
+block on launch? `npm run build:launcher` installs a ~1 KB node launcher into the
+same PATH directory instead — it requires `node` on PATH but re-reads the CLI
+source on every run, so there is no rebuild step. The two packagings are mutually
+exclusive; each build removes the other's files, because `cmd.exe` and Git Bash
+would otherwise disagree about which one `mcpctl` means.
+
 Covers the bridge end-to-end with automatic host recovery: it detects a wedged
 or dead host (kills it, waits for the extension to respawn it) and transparently
 retries mid-call failures caused by service-worker idle-kills. It also manages
@@ -202,7 +290,12 @@ MCP sessions properly (init + DELETE on exit) so you never hit the bridge's
 single-session limit.
 
 ```bash
-mcpctl status                bridge health + host PID
+mcpctl status [--wait N]     real bridge health (host + extension roundtrip)
+mcpctl ping                  verify a session + tool roundtrip (latency)
+mcpctl doctor                full environment report (host, browser, manifest,
+                             extension-ID match) — run when something won't start
+mcpctl ensure [--wait N]     bring the bridge up: wait / launch browser / restart
+                             stale host until a real session roundtrip works
 mcpctl eval "40+2"           run JS in the active tab
 mcpctl tabs | active         windows/tabs, active tab info
 mcpctl switch <tabId>        switch to tab
@@ -220,12 +313,15 @@ mcpctl batch file.json       run a JSON-array / JSONL batch in one session
 mcpctl repl                  interactive REPL (!tool {json} for raw calls)
 ```
 
-Global flags: `--json`, `--tab <id>`, `--port <n>`, `--host <h>`,
-`--timeout <sec>`; env vars `MCP_PORT` / `MCP_HOST`. Full command reference:
+Global flags: `--json`, `--tab <id>`, `--port <n>`, `--host <h>`, `--timeout <sec>`,
+`--lock-timeout <sec>`; env vars `MCP_PORT` / `MCP_HOST`. Full command reference:
 [`app/README.md`](app/README.md) or `mcpctl help`.
 
-> Note: the bridge host keeps a single MCP session — run commands serially;
-> concurrent invocations can collide and trigger a host restart.
+> Health is measured with a real extension tool roundtrip — never a bare TCP
+> check — so a standalone host without the extension reports `state: broken`,
+> not a false "ok". Session commands fail fast (exit `3`) when the bridge is
+> down, and self-serialize via a lockfile: concurrent mcpctl invocations queue
+> instead of colliding and triggering host restarts.
 
 ## Legacy CLI (`mcp` / `scripts/mcp.js`)
 

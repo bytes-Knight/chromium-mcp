@@ -55,6 +55,35 @@ body {
 
 /* endpoint */
 .endpoint { display: flex; flex-direction: column; gap: 6px; }
+
+/* instance (multi-browser identity) */
+.instance { display: flex; flex-direction: column; gap: 6px; }
+.inst-row { display: flex; gap: 8px; align-items: center; }
+.inst-row code {
+  flex: 1;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "Cascadia Code", Menlo, monospace;
+}
+.label-row { display: flex; gap: 8px; align-items: center; }
+.label-row input {
+  flex: 1;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.label-row button { padding: 6px 10px; }
+
 .endpoint-row { display: flex; gap: 8px; align-items: center; }
 .endpoint-row code {
   flex: 1;

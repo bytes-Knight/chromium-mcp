@@ -76,6 +76,12 @@ function browserConfigs() {
         manifestDir: path.join(ap, 'Chromium', 'NativeMessagingHosts'),
       },
       {
+        id: 'edge',
+        display: 'Microsoft Edge',
+        reg: `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${HOST_NAME}`,
+        manifestDir: path.join(la, 'Microsoft', 'Edge', 'User Data', 'NativeMessagingHosts'),
+      },
+      {
         id: 'brave',
         display: 'Brave',
         reg: `HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\${HOST_NAME}`,
@@ -100,6 +106,7 @@ function browserConfigs() {
     return [
       { id: 'chrome', display: 'Google Chrome', reg: null, manifestDir: path.join(base, 'Google', 'Chrome', 'NativeMessagingHosts') },
       { id: 'chromium', display: 'Chromium', reg: null, manifestDir: path.join(base, 'Chromium', 'NativeMessagingHosts') },
+      { id: 'edge', display: 'Microsoft Edge', reg: null, manifestDir: path.join(base, 'Microsoft Edge', 'NativeMessagingHosts') },
       { id: 'brave', display: 'Brave', reg: null, manifestDir: path.join(base, 'BraveSoftware', 'Brave-Browser', 'NativeMessagingHosts') },
       { id: 'brave-beta', display: 'Brave-Beta', reg: null, manifestDir: path.join(base, 'BraveSoftware', 'Brave-Browser-Beta', 'NativeMessagingHosts') },
       { id: 'brave-nightly', display: 'Brave-Nightly', reg: null, manifestDir: path.join(base, 'BraveSoftware', 'Brave-Browser-Nightly', 'NativeMessagingHosts') },
@@ -109,6 +116,7 @@ function browserConfigs() {
   return [
     { id: 'chrome', display: 'Google Chrome', reg: null, manifestDir: path.join(base, 'google-chrome', 'NativeMessagingHosts') },
     { id: 'chromium', display: 'Chromium', reg: null, manifestDir: path.join(base, 'chromium', 'NativeMessagingHosts') },
+    { id: 'edge', display: 'Microsoft Edge', reg: null, manifestDir: path.join(base, 'microsoft-edge', 'NativeMessagingHosts') },
     { id: 'brave', display: 'Brave', reg: null, manifestDir: path.join(base, 'brave-browser', 'NativeMessagingHosts') },
     { id: 'brave-beta', display: 'Brave-Beta', reg: null, manifestDir: path.join(base, 'brave-browser-beta', 'NativeMessagingHosts') },
     { id: 'brave-nightly', display: 'Brave-Nightly', reg: null, manifestDir: path.join(base, 'brave-browser-nightly', 'NativeMessagingHosts') },

@@ -3,6 +3,7 @@
 
 importScripts(
   'lib/protocol.js',
+  'lib/instance.js',
   'lib/cdp.js',
   'lib/tabs.js',
   'tools/browser.js',
@@ -13,25 +14,56 @@ importScripts(
   'tools/console.js',
   'tools/data.js',
   'tools/inject.js',
-  'tools/misc.js'
+  'tools/misc.js',
+  'tools/instance.js'
 );
 
 // ---- Native messaging connection --------------------------------------------
 let port = null;
 let connected = false;
 let serverRunning = false;
+// Each browser instance owns its own MCP port (multi-browser support). We start
+// from the persisted port (or the deterministic per-instance default) and only
+// move ports on a real EADDRINUSE collision.
 let mcpPort = DEFAULT_MCP_PORT;
+let portAttempts = 0;
 
 const pendingReplies = new Map(); // requestId -> {resolve, reject}
 
-function ensurePort() {
+// Reallocate to the next free port after an EADDRINUSE and reconnect. Used when
+// another bridge instance already owns our port — squatting on it would
+// silently drive the WRONG browser.
+function reallocatePort() {
+  try { if (port) port.disconnect(); } catch (e) { /* ignore */ }
+  port = null;
+  connected = false;
+  serverRunning = false;
+  mcpPort = BRIDGE_INSTANCE.nextPort(mcpPort);
+  BRIDGE_INSTANCE.savePort(mcpPort);
+  portAttempts++;
+  updateStatus();
+  if (portAttempts > BRIDGE_INSTANCE.PORT_SPAN + 2) {
+    console.warn('[bridge] gave up finding a free MCP port (all ports in range busy). Click Connect to retry.');
+    portAttempts = 0;
+    return;
+  }
+  // Give the loser host a moment to die, then retry on the next port.
+  setTimeout(() => ensurePort(), 400);
+}
+
+async function ensurePort() {
   if (port) return port;
+  // First connect: settle on this instance's port (persisted or deterministic).
+  if (mcpPort === DEFAULT_MCP_PORT) {
+    const saved = await BRIDGE_INSTANCE.getSavedPort();
+    mcpPort = saved || (await BRIDGE_INSTANCE.defaultPort());
+  }
   try {
     port = chrome.runtime.connectNative(HOST_NAME);
     port.onMessage.addListener(onNativeMessage);
     port.onDisconnect.addListener(onPortDisconnect);
     connected = true;
-    // Ask the host to start the local MCP server
+    // Ask the host to start the local MCP server on THIS instance's port.
     port.postMessage({ type: MSG.START, payload: { port: mcpPort } });
     updateStatus();
     return port;
@@ -73,6 +105,9 @@ function onNativeMessage(msg) {
   switch (msg.type) {
     case MSG.SERVER_STARTED:
       serverRunning = true;
+      portAttempts = 0;
+      // Persist the port we actually bound so restarts keep the same endpoint.
+      BRIDGE_INSTANCE.savePort(mcpPort);
       chrome.alarms.clear('bridge-reconnect');
       updateStatus();
       break;
@@ -82,11 +117,14 @@ function onNativeMessage(msg) {
       break;
     case MSG.ERROR:
     case MSG.ERROR_FROM_NATIVE_HOST:
-      // "already running" / EADDRINUSE is expected when another extension's host
-      // already owns the port (or the server is simply already up).
-      if (/already running|already in use|EADDRINUSE/i.test(String(msg.payload && msg.payload.message || msg.error || ''))) {
-        serverRunning = true;
-        updateStatus();
+      // EADDRINUSE: another process owns our port. With multiple browsers each
+      // running their own bridge instance this must NOT be treated as "already
+      // running" — it likely means a DIFFERENT browser squatted on our port.
+      // Reallocate to the next free port instead (harmless even when the stale
+      // host was our own: it dies with the dead connection and we get a fresh
+      // one on the new port).
+      if (/already running|already in use|EADDRINUSE|in use by another/i.test(String(msg.payload && msg.payload.message || msg.error || ''))) {
+        reallocatePort();
       } else {
         console.warn('[bridge] native host message:', msg.payload && msg.payload.message || msg.error);
       }
@@ -150,12 +188,34 @@ function updateStatus() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'bridge-status') {
-    sendResponse({ connected, serverRunning, mcpPort, hostName: HOST_NAME });
+    (async () => {
+      const [instanceId, label, browser] = await Promise.all([
+        BRIDGE_INSTANCE.getInstanceId(),
+        BRIDGE_INSTANCE.getLabel(),
+        BRIDGE_INSTANCE.getBrowserInfo(),
+      ]);
+      sendResponse({ connected, serverRunning, mcpPort, hostName: HOST_NAME, instanceId, label, browser });
+    })();
     return true;
   }
   if (msg && msg.type === 'bridge-connect') {
-    mcpPort = msg.port || DEFAULT_MCP_PORT;
+    if (msg.port && parseInt(msg.port, 10) !== mcpPort) {
+      // Explicit port from the popup: honor it and persist (user override).
+      mcpPort = parseInt(msg.port, 10) || DEFAULT_MCP_PORT;
+      BRIDGE_INSTANCE.savePort(mcpPort);
+    }
     ensurePort();
+    sendResponse({ connected, serverRunning, mcpPort });
+    return true;
+  }
+  if (msg && msg.type === 'bridge-set-label') {
+    BRIDGE_INSTANCE.setLabel(msg.label);
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg && msg.type === 'bridge-next-port') {
+    // Force-reallocate to the next port (conflict resolution / manual move).
+    reallocatePort();
     sendResponse({ connected, serverRunning, mcpPort });
     return true;
   }
