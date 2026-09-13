@@ -3,3 +3,6 @@ app/dist/
 app/sea-prep.blob
 app/sea-config.json
 node_modules/
+
+# legacy mcp CLI SEA build (see scripts/build-exe.js)
+dist/

@@ -1419,6 +1419,21 @@ async function ensureBridge(flags) {
 // own port is down, or while another client holds every session).
 const DISCOVERY_COMMANDS = ['browsers', 'instances', 'list'];
 
+// Every command the dispatchers understand, validated BEFORE any bridge work.
+// Otherwise a typo is reported as "bridge DOWN" (exit 3) whenever no browser is
+// connected, and as a usage error (exit 2) when one is - a contract that depends
+// on the environment is not a contract.
+const KNOWN_COMMANDS = new Set([
+  'status', 'restart', 'ping', 'ensure', 'doctor', 'diag',
+  'tabs', 'windows', 'active', 'switch', 'close',
+  'read', 'content', 'interactive', 'eval', 'run',
+  'click', 'hover', 'fill', 'keys', 'nav', 'shot',
+  'history', 'bookmarks', 'net', 'console', 'dialog', 'upload',
+  'inject', 'sendcmd', 'storage', 'computer',
+  'tools', 'call', 'batch', 'label', 'repl', 'help', '-h', '--help',
+  ...DISCOVERY_COMMANDS,
+]);
+
 // ------------------------------------------------------------------- main ---
 const USAGE = `mcpctl - standalone CLI for the Chrome MCP bridge
 
@@ -1526,6 +1541,11 @@ async function main() {
   }
   flags = Object.assign({}, leadFlags, flags);
   applyGlobalFlags(flags); // honor --port/--host/--timeout/--lock-timeout/--browser for every command
+
+  if (!KNOWN_COMMANDS.has(command)) {
+    process.stderr.write(`[mcpctl] unknown command: ${command} (try: help)\n`);
+    process.exit(2);
+  }
 
   try {
     // Multi-browser targeting: --browser <selector> resolves to the matching

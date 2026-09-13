@@ -461,12 +461,6 @@ registerTool('chrome_upload_file', async (args = {}) => {
   }
 });
 
-// ---- Exotic tools (stubs with clear errors) ---------------------------------
-registerTool('chrome_gif_recorder', async (args = {}) => notImplemented('chrome_gif_recorder'));
-registerTool('performance_start_trace', async (args = {}) => notImplemented('performance_start_trace'));
-registerTool('performance_stop_trace', async (args = {}) => notImplemented('performance_stop_trace'));
-registerTool('performance_analyze_insight', async (args = {}) => notImplemented('performance_analyze_insight'));
-registerTool('rr_list_published_flows', async (args = {}) => {
-  // The MCP server queries dynamic flow tools; clean-room build has none.
-  return { status: 'success', items: [] };
-});
+// The GIF recorder (tools/gif.js) and performance tracing (tools/perf.js) are
+// implemented in their own modules — no stubs here. rr_list_published_flows is
+// answered by the service worker directly (see background.js).
