@@ -2,6 +2,8 @@
 app/dist/
 app/sea-prep.blob
 app/sea-config.json
+app/sea-prep.bridge-host.blob
+app/sea-config.bridge-host.json
 node_modules/
 
 # legacy mcp CLI SEA build (see scripts/build-exe.js)

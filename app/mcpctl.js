@@ -34,6 +34,9 @@ let cfg = {
   range: null,                // --range N-M -> port range scanned by discovery
   timeout: 60000,             // per-RPC budget (nav/eval on slow pages); override with --timeout
   lockTimeout: 60000,         // how long to wait for another mcpctl to release the bridge lock
+  strictPort: false,          // --strict-port / MCP_STRICT_PORT=1 -> never auto-retarget a dead pinned --port
+  quiet: false,               // --quiet -> suppress info lines on stderr (payload only)
+  raw: false,                 // --raw   -> print the tool envelope verbatim (no unwrapping)
 };
 
 let lockHeld = false;
@@ -58,23 +61,45 @@ function parseResponse(text) {
 
 async function mcpRpc(method, params, sessionId, timeoutMs, port) {
   rpcCounter++;
+  const startedAt = Date.now();
   const body = JSON.stringify({ jsonrpc: '2.0', id: rpcCounter, method, params });
   const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
   if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+  const budget = timeoutMs || cfg.timeout;
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs || cfg.timeout);
+  const timer = setTimeout(() => ctl.abort(), budget);
   const url = mcpUrl(port);
   let res;
   try {
     res = await fetch(url, { method: 'POST', headers, body, signal: ctl.signal });
   } catch (e) {
+    clearTimeout(timer);
     throw new Error(`bridge unreachable at ${url} (${e.message}). Start Chrome with the extension connected, or run "mcpctl restart".`);
+  }
+  // The deadline must also cover the response BODY: a wedged host answers the
+  // request and then holds the stream open (streamable-HTTP/SSE semantics), so
+  // a plain `await res.text()` here - after clearTimeout - used to hang this
+  // process forever while it held the cross-process lock, freezing every later
+  // invocation until its lock timeout (the "random mcpctl freeze"). Race the
+  // body read against the remaining budget and tear the socket down on miss.
+  const left = Math.max(1000, budget - (Date.now() - startedAt));
+  let bodyTimer = null;
+  try {
+    const text = await Promise.race([
+      res.text(),
+      new Promise((_, rej) => {
+        bodyTimer = setTimeout(() => rej(new Error(`response body exceeded ${left}ms - host held the stream open (wedged bridge)`)), left);
+        if (bodyTimer.unref) bodyTimer.unref();
+      }),
+    ]);
+    return { status: res.status, sessionId: res.headers.get('mcp-session-id'), parsed: parseResponse(text), raw: text };
+  } catch (e) {
+    try { ctl.abort(); } catch (a) { /* already aborted */ }
+    throw e;
   } finally {
+    if (bodyTimer) clearTimeout(bodyTimer);
     clearTimeout(timer);
   }
-  const sid = res.headers.get('mcp-session-id');
-  const text = await res.text();
-  return { status: res.status, sessionId: sid, parsed: parseResponse(text), raw: text };
 }
 
 async function initSession(port, timeoutMs = 15000) {
@@ -92,8 +117,18 @@ async function initSession(port, timeoutMs = 15000) {
   return init.sessionId;
 }
 
-async function closeSession(sessionId, port) {
-  try { await fetch(mcpUrl(port), { method: 'DELETE', headers: { 'Mcp-Session-Id': sessionId } }); } catch (e) { /* ignore */ }
+// Bounded DELETE. This runs in the `finally` of EVERY probe, so an unbounded
+// fetch here meant a single wedged host (socket accepted, no reply) could hang
+// the whole port scan - and `browsers` with it - forever. 2.5s and move on.
+async function closeSession(sessionId, port, timeoutMs = 2500) {
+  if (!sessionId) return;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* already gone */ } }, timeoutMs);
+  if (timer.unref) timer.unref();
+  try {
+    await fetch(mcpUrl(port), { method: 'DELETE', headers: { 'Mcp-Session-Id': sessionId }, signal: ctl.signal });
+  } catch (e) { /* ignore - a wedged host must never hang the caller */ }
+  finally { clearTimeout(timer); }
 }
 
 // ------------------------------------------------------- instance cache ---
@@ -122,27 +157,35 @@ function cachedInstance(port) {
 }
 
 // ------------------------------------------------------------ host recovery ---
+// ALWAYS resolves within timeoutMs. The old version only re-armed on 'error':
+// a port that neither accepts nor refuses (firewalled, or a listener that never
+// completes the handshake) fired no event at all, so the promise never settled
+// and every caller - probes, restart waits, discovery - hung with it.
 function portOpen(port, host, timeoutMs = 2000) {
   return new Promise((resolve) => {
-    const start = Date.now();
-    const check = () => {
+    let settled = false;
+    const budget = Math.max(150, timeoutMs);
+    const finish = (v) => { if (!settled) { settled = true; clearTimeout(hard); resolve(v); } };
+    const hard = setTimeout(() => finish(false), budget);
+    if (hard.unref) hard.unref();
+    const attempt = () => {
+      if (settled) return;
       const sock = net.connect({ port, host });
-      sock.on('connect', () => { sock.destroy(); resolve(true); });
-      sock.on('error', () => {
-        sock.destroy();
-        if (Date.now() - start > timeoutMs) resolve(false);
-        else setTimeout(check, 200);
-      });
+      const kill = setTimeout(() => { sock.destroy(); }, budget);
+      if (kill.unref) kill.unref();
+      sock.on('connect', () => { clearTimeout(kill); sock.destroy(); finish(true); });
+      sock.on('error', () => { clearTimeout(kill); sock.destroy(); setTimeout(attempt, 120); });
+      sock.on('timeout', () => { clearTimeout(kill); sock.destroy(); });
     };
-    check();
+    attempt();
   });
 }
 
-function hostPid() {
+function hostPidOn(port) {
   try {
     const out = execSync('netstat -ano', { encoding: 'utf8', windowsHide: true, timeout: 10000 });
     for (const line of out.split(/\r?\n/)) {
-      if (line.includes(':' + cfg.port) && /LISTENING/i.test(line)) {
+      if (line.includes(':' + port) && /LISTENING/i.test(line)) {
         const m = line.trim().split(/\s+/);
         return m[m.length - 1];
       }
@@ -150,30 +193,65 @@ function hostPid() {
   } catch (e) { /* ignore */ }
   return null;
 }
+function hostPid() { return hostPidOn(cfg.port); }
 
-async function restartHost() {
-  const pid = hostPid();
-  if (!pid) return false; // nothing was listening -> nothing to restart, no respawn coming
+function killPid(pid) {
   try {
     if (process.platform === 'win32') execSync(`taskkill /F /PID ${pid}`, { windowsHide: true });
     else execSync(`kill -9 ${pid}`, { stdio: 'ignore' });
-  } catch (e) { /* already dead */ }
+    return true;
+  } catch (e) { return false; } // already dead
+}
+
+// Chromium-family image names the respawn check accepts. Custom builds rename
+// the exe, so detection is a heuristic - never a hard gate (see restartHost).
+const BROWSER_IMAGES = ['chrome.exe', 'msedge.exe', 'brave.exe', 'chromium.exe', 'vivaldi.exe', 'opera.exe', 'arc.exe'];
+function browserRunning() { return BROWSER_IMAGES.some((img) => processRunning(img)); }
+
+async function restartHost() {
+  const pid = hostPid();
+  if (!pid) return { ok: false, port: cfg.port }; // nothing was listening -> nothing to restart, no respawn coming
+  killPid(pid);
   // Wait for the port to actually close.
   await waitPortClosed(cfg.host, cfg.port, 15000);
   // The host only respawns when the extension reconnects over native messaging.
-  // Don't burn up to 45s waiting when no browser with the extension is running.
-  if (!(chromeRunning() || processRunning('brave.exe') || processRunning('msedge.exe'))) return false;
+  // Don't burn up to 45s waiting when no browser with the extension is running -
+  // but allow one short grace window first, since the process-name heuristic can
+  // miss custom Chromium builds.
+  if (!browserRunning()) {
+    await sleep(6000);
+    if (!browserRunning()) return { ok: false, port: cfg.port };
+  }
   // Wait for a host whose session probe actually succeeds (host + extension),
   // bailing early on 'busy' (rogue singleton) and skipping pure port-open states.
+  // The respawn may land on a DIFFERENT port (EADDRINUSE -> next free slot), so
+  // sweep the range when the pinned port stays silent and follow the bridge.
   const deadline = Date.now() + 45000;
   while (Date.now() < deadline) {
-    if (!(await portOpen(cfg.port, cfg.host, 400))) { await sleep(500); continue; }
-    const probe = await probeSession(3000);
-    if (probe.state === 'ok') { await sleep(800); return true; }
-    if (probe.state === 'busy') return false;
+    if (await portOpen(cfg.port, cfg.host, 400)) {
+      const probe = await probeSession(3000);
+      if (probe.state === 'ok') { await sleep(800); return { ok: true, port: cfg.port }; }
+      if (probe.state === 'busy') return { ok: false, port: cfg.port };
+    }
+    const alt = await findRespawnedPort();
+    if (alt) { cfg.port = alt; await sleep(800); return { ok: true, port: alt }; }
     await sleep(1000);
   }
-  return false;
+  return { ok: false, port: cfg.port };
+}
+
+// Scan the port range (skipping the pinned port) for a freshly respawned bridge.
+async function findRespawnedPort() {
+  const [lo, hi] = parseRange(cfg.range || PORT_RANGE);
+  const cands = [];
+  for (let p = lo; p <= hi; p++) if (p !== cfg.port) cands.push(p);
+  for (let start = 0; start < cands.length; start += SCAN_CONCURRENCY) {
+    const batch = cands.slice(start, start + SCAN_CONCURRENCY).map((p) => probeInstanceOn(p, 2000));
+    const res = await Promise.all(batch);
+    const ok = res.find((r) => r.state === 'ok');
+    if (ok) return ok.port;
+  }
+  return null;
 }
 
 async function waitPortClosed(host, port, timeoutMs) {
@@ -236,7 +314,7 @@ async function acquireLock(timeoutMs) {
       if (stale) { try { fs.unlinkSync(lp); } catch (u) { /* raced */ } continue; }
       if (Date.now() - start >= timeoutMs) {
         throw new LockBusyError(
-          `another mcpctl instance is busy (lock: ${lp}). Wait for it to finish, or delete the lock file if it is stale.`);
+          `another mcpctl instance (pid ${pid}) is busy (lock: ${lp}). Wait for it to finish, or delete the lock file if it is stale.`);
       }
       await sleep(150);
     }
@@ -302,6 +380,27 @@ function extIdFromKey(keyB64) {
     return id;
   } catch (e) { return null; }
 }
+// Every per-browser native-messaging manifest location we know about. Each
+// Chromium-family browser keeps its OWN host list, so a host registered for
+// Chrome alone leaves the bridge permanently offline in Brave/Edge/Chromium.
+// doctor reports all of them instead of only the first that exists.
+function nativeHostManifestCandidates() {
+  const ap = process.env.APPDATA || '';
+  const la = process.env.LOCALAPPDATA || '';
+  const pd = process.env.ProgramData || '';
+  const name = 'com.chromemcp.nativehost.json';
+  return [
+    { browser: 'chrome', path: path.join(ap, 'Google', 'Chrome', 'NativeMessagingHosts', name) },
+    { browser: 'chrome', path: path.join(la, 'Google', 'Chrome', 'User Data', 'NativeMessagingHosts', name) },
+    { browser: 'chrome', path: path.join(pd, 'Google', 'Chrome', 'NativeMessagingHosts', name) },
+    { browser: 'edge', path: path.join(la, 'Microsoft', 'Edge', 'User Data', 'NativeMessagingHosts', name) },
+    { browser: 'brave', path: path.join(la, 'BraveSoftware', 'Brave-Browser', 'User Data', 'NativeMessagingHosts', name) },
+    { browser: 'brave-beta', path: path.join(la, 'BraveSoftware', 'Brave-Browser-Beta', 'User Data', 'NativeMessagingHosts', name) },
+    { browser: 'brave-nightly', path: path.join(la, 'BraveSoftware', 'Brave-Browser-Nightly', 'User Data', 'NativeMessagingHosts', name) },
+    { browser: 'chromium', path: path.join(ap, 'Chromium', 'NativeMessagingHosts', name) },
+  ].filter((c) => c.path && /nativehost/i.test(c.path));
+}
+
 function nativeHostManifestPath() {
   const la = process.env.LOCALAPPDATA || '';
   const cands = [
@@ -365,7 +464,7 @@ function stateNote(state, extra) {
   switch (state) {
     case 'ok': return 'bridge healthy - host + extension roundtrip ok';
     case 'down': return `bridge DOWN - nothing listening on ${mcpUrl()}`;
-    case 'busy': return 'bridge busy - another MCP client holds the singleton session (run "mcpctl restart" to reclaim it)';
+    case 'busy': return 'bridge busy - another MCP client holds the singleton session (run "mcpctl restart" to reclaim it, or "mcpctl reap" if zombie hosts piled up)';
     case 'broken': return `bridge host UP but extension unreachable (${extra || 'session probe failed'})`;
     default: return String(state);
   }
@@ -374,9 +473,13 @@ function stateNote(state, extra) {
 // ----------------------------------------------------------------- instance ---
 // Multi-browser support: every browser running the extension owns its own MCP
 // port. These helpers discover live instances and resolve --browser targets.
-async function fetchInstanceInfo(sessionId, port) {
+// `timeoutMs` is deliberately explicit at the call sites inside probes: leaving
+// it undefined let these calls inherit cfg.timeout (60s), so a host whose
+// extension was gone - answering initialize, then stalling on tools/call -
+// burned a full minute per port and made every `browsers` sweep look frozen.
+async function fetchInstanceInfo(sessionId, port, timeoutMs) {
   try {
-    const r = await callTool(sessionId, 'bridge_get_instance_info', {}, undefined, port);
+    const r = await callTool(sessionId, 'bridge_get_instance_info', {}, timeoutMs, port);
     return r.parsed || null;
   } catch (e) {
     return null;
@@ -385,9 +488,9 @@ async function fetchInstanceInfo(sessionId, port) {
 
 // Identity-less description of an instance: window/tab counts + the active tab.
 // Used only when the identity tool is unavailable (extension older than this CLI).
-async function fetchInstanceFallback(sessionId, port) {
+async function fetchInstanceFallback(sessionId, port, timeoutMs) {
   try {
-    const r = await callTool(sessionId, 'get_windows_and_tabs', {}, undefined, port);
+    const r = await callTool(sessionId, 'get_windows_and_tabs', {}, timeoutMs, port);
     const wins = r.parsed;
     if (!Array.isArray(wins)) return null;
     const tabs = wins.flatMap((w) => w.tabs || []);
@@ -404,8 +507,28 @@ async function fetchInstanceFallback(sessionId, port) {
 
 // Probe ONE port for a live bridge instance. Read-only: never takes the lock
 // (probing must not collide with itself) and fails fast on busy sessions.
+// Hard-bounded wrapper. Every individual RPC inside is already deadline'd, but
+// a scan is only as fast as its slowest member: this guarantees one wedged port
+// can never hold a batch past ~2x its probe budget, so `browsers` always returns.
 async function probeInstanceOn(port, timeoutMs = 3000) {
+  const bounded = Math.max(1200, Math.min(timeoutMs || 3000, 3000));
   const start = Date.now();
+  let timer = null;
+  const hard = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({
+      port, state: 'broken', ms: Date.now() - start,
+      note: 'probe exceeded its deadline (host accepted the socket but never answered)',
+    }), bounded * 2 + 1500);
+    if (timer.unref) timer.unref();
+  });
+  try {
+    return await Promise.race([hard, probeInstanceInner(port, bounded, start)]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function probeInstanceInner(port, timeoutMs, start) {
   // NOTE: no `cfg.port` mutation anywhere in here. Scans run in parallel, so
   // every RPC must carry its own port explicitly or the probes race each other
   // and report the wrong endpoint.
@@ -429,12 +552,23 @@ async function probeInstanceOn(port, timeoutMs = 3000) {
     }
     sid = init.sessionId;
     await mcpRpc('notifications/initialized', {}, sid, timeoutMs, port).catch(() => {});
-    const info = await fetchInstanceInfo(sid, port);
+    const info = await fetchInstanceInfo(sid, port, timeoutMs);
     if (info) cacheInstance(port, info);
     // Older extension builds have no identity tool. Rather than report a live
     // browser as a blank row, fall back to its tabs so a human can still tell
     // the instances apart ("that's the one with the Jira tab").
-    const unidentified = info ? null : await fetchInstanceFallback(sid, port);
+    const unidentified = info ? null : await fetchInstanceFallback(sid, port, timeoutMs);
+    // A host that accepts a session but answers NO tool at all is a zombie: its
+    // process is still listening while the extension is gone. Reporting that as
+    // "ok" is what let a dead host on the DEFAULT port shadow the live browser
+    // one slot over - so `tabs` (and everything else) died on the zombie while a
+    // healthy bridge sat at :12307. Zombies are now broken, never preferred.
+    if (!info && !unidentified) {
+      return {
+        port, state: 'broken', ms: Date.now() - start,
+        note: 'host answers MCP but dispatches no tools (zombie host - run "mcpctl reap")',
+      };
+    }
     return { port, state: 'ok', ms: Date.now() - start, info, unidentified };
   } catch (e) {
     return { port, state: 'broken', ms: Date.now() - start, note: String((e && e.message) || e).slice(0, 140) };
@@ -452,15 +586,59 @@ function parseRange(range) {
   const lo = parseInt(m[1], 10), hi = parseInt(m[2], 10);
   return lo <= hi ? [lo, hi] : [hi, lo];
 }
-async function scanInstances(range, timeoutMs = 3000) {
+// `overallMs` caps the WHOLE sweep: discovery returns whatever it has instead of
+// running to the end of the range when several ports are wedged (partial results
+// beat a hang for a command whose job is to answer "what is live right now?").
+async function scanInstances(range, timeoutMs = 3000, overallMs = 20000) {
   const [lo, hi] = parseRange(range);
   const out = [];
+  const deadline = Date.now() + Math.max(4000, overallMs);
   for (let start = lo; start <= hi; start += SCAN_CONCURRENCY) {
+    if (Date.now() > deadline) break;
     const batch = [];
     for (let p = start; p <= Math.min(hi, start + SCAN_CONCURRENCY - 1); p++) batch.push(probeInstanceOn(p, timeoutMs));
     out.push(...(await Promise.all(batch)));
   }
   return out.filter((r) => r.state !== 'down');
+}
+
+// The extension owns its own port (deterministic per browser instance, and it
+// moves to the next free slot on an EADDRINUSE collision), so 12306 is only a
+// starting guess. When that port is dead and the caller pinned neither --port
+// nor --browser, look for the live instance elsewhere in the range before any
+// command fails with "bridge DOWN" while the bridge is up one port over.
+function instanceLiveness(inst) {
+  if (!inst) return 0;
+  if (inst.info) return 2;         // identity tool answered -> extension is attached
+  if (inst.unidentified) return 1; // tabs fallback answered -> extension is attached
+  return 0;                        // bare MCP server: maybe a zombie host
+}
+
+async function discoverLivePort(range) {
+  // A host process can outlive its extension (the service worker dies while the
+  // host keeps listening), and such a zombie still answers initialize. It must
+  // never win over an instance a real extension is attached to, or every command
+  // targets a port nothing can serve.
+  let best = null;
+  const consider = (inst, cached) => {
+    if (!inst || (inst.state !== 'ok' && inst.state !== 'busy')) return;
+    const rank = instanceLiveness(inst);
+    if (!best || rank > best.rank) best = { port: inst.port, probe: inst, rank, cached: !!cached };
+  };
+
+  // A port we probed before is the cheapest first guess; only sweep the whole
+  // range when the cache has nothing live.
+  const cachedPorts = Object.keys(readInstanceCache())
+    .map((p) => parseInt(p, 10))
+    .filter((p) => Number.isInteger(p) && p !== cfg.port);
+  for (const p of cachedPorts) {
+    if (!(await portOpen(p, cfg.host, 300))) continue;
+    consider(await probeInstanceOn(p, 2500), true);
+    if (best && best.rank >= 2) return best;
+  }
+  if (best && best.rank >= 2) return best;
+  for (const inst of await scanInstances(range, 2500)) consider(inst, false);
+  return best;
 }
 
 // Selectors a user can hand back to --browser. Prefer a stable, human-meaningful
@@ -585,7 +763,15 @@ function fmtInstances(list, target) {
 }
 
 function remediation() {
-  return 'Fix: open the browser with the bridge extension loaded (chrome-mcp-extension/) so it auto-starts the host; run "mcpctl doctor" for a full environment report; or run "mcpctl ensure --wait 90" to wait for / launch the bridge.';
+  const bits = [];
+  // Name the actual blocker first: "bridge down" and "browser not running" are
+  // different problems, and the second one is the common one after a reboot.
+  if (!browserRunning()) {
+    bits.push('No Chromium browser is running right now - run "mcpctl ensure" (or "mcpctl restart") and it will launch one for you.');
+  }
+  bits.push('Each browser instance owns a port in ' + PORT_RANGE + ', and every command auto-targets the live one, so "mcpctl restart" is enough to recover.');
+  bits.push('"mcpctl browsers" lists every live instance; "mcpctl doctor" has the full environment report; "mcpctl ensure --wait 90" waits for or launches the bridge.');
+  return bits.join(' ');
 }
 function statusObject(probe) {
   return {
@@ -593,6 +779,7 @@ function statusObject(probe) {
     state: probe.state,
     host: cfg.host, port: cfg.port,
     hostPid: hostPid(),
+    browserRunning: browserRunning(),
     mcpUrl: mcpUrl(),
     note: stateNote(probe.state, probe.note),
   };
@@ -623,10 +810,29 @@ process.on('exit', () => { if (lockHeld) releaseLock(); });
 // the service worker can be idle-killed by the browser, dropping the native
 // port and taking the in-flight HTTP stream down with it).
 const TRANSPORT_ERROR_RE = /terminated|fetch failed|ECONNRESET|socket hang up|UND_ERR|other side closed/i;
+
+// Soft recovery for transient session errors: the extension's service worker is
+// allowed to sleep between calls, so a failed handshake usually just needs a
+// moment. Bounded (~7s) so a genuinely wedged host still falls through to the
+// restart path quickly.
+async function retryInit(attempts = 5, gapMs = 700) {
+  for (let i = 0; i < attempts; i++) {
+    await sleep(gapMs);
+    if (!(await portOpen(cfg.port, cfg.host, 400))) return { error: null }; // port gone -> restart path
+    try {
+      return { sessionId: await initSession(undefined, 8000) };
+    } catch (e) {
+      const m = String((e && e.message) || e);
+      if (!(m.includes(FUSE_OK) || TRANSPORT_ERROR_RE.test(m))) return { fatal: e };
+    }
+  }
+  return { error: null };
+}
 async function withSession(fn) {
   // Serialize invocations (single-session bridge) before probing.
   await acquireLock(cfg.lockTimeout);
   let sessionId = null;
+  let recoveredDown = false; // one self-heal pass per invocation, never a loop
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       const probe = await probeSession(4000);
@@ -638,17 +844,74 @@ async function withSession(fn) {
         } catch (e) {
           const m = String((e && e.message) || e);
           if (!(m.includes(FUSE_OK) || TRANSPORT_ERROR_RE.test(m))) throw BridgeError.from(e);
-          // else: stale singleton or mid-call transport death -> restart below
+          // Stale singleton ("Already connected") or an idle-killed service
+          // worker is TRANSIENT - the extension wakes again on the next
+          // roundtrip. Retry the handshake with backoff first: killing the host
+          // out from under a working extension was the sledgehammer, and when
+          // the respawn never arrived it left the bridge down for good.
+          const soft = await retryInit();
+          if (soft.sessionId) {
+            sessionId = soft.sessionId;
+            activeSession = sessionId;
+            return await fn(sessionId);
+          }
+          if (soft.fatal) throw BridgeError.from(soft.fatal);
+          // Still no session - only now is a host restart justified.
         }
       } else if (probe.state === 'down') {
-        // Definitive: nothing is listening. Fail fast instead of retrying.
+        // Nothing on this port. That is usually not a dead bridge but a MOVED
+        // one (the host takes the next free slot after a respawn) or a closed
+        // browser - so attempt one bounded, quiet recovery before failing.
+        // Any command then heals the bridge instead of demanding the user go
+        // hunt for the right port number: the "random port" pain, gone.
+        if (!recoveredDown) {
+          recoveredDown = true;
+          if (!cfg.strictPort) {
+            const found = await discoverLivePort(cfg.range);
+            if (found) {
+              cfg.port = found.port;
+              process.stderr.write(`[mcpctl] bridge was on another port - now using ${cfg.host}:${cfg.port}\n`);
+              continue;
+            }
+          }
+          if (browserRunning()) {
+            // Only kill-and-wait when a host process actually EXISTS. A pinned
+            // port that was never listening usually means the browser/extension
+            // is still starting up - killing "nothing" and then racing the
+            // extension's own spawn is exactly how a healthy fresh host gets
+            // murdered at birth. Give the extension's alarm-driven reconnect
+            // one bounded chance first; it needs no kill at all.
+            const existing = hostPid();
+            if (!existing) {
+              process.stderr.write('[mcpctl] bridge DOWN - no host yet, giving the extension 12s to connect on its own...\n');
+              const grew = await waitPortOpen(cfg.host, cfg.port, 12000) ||
+                (!cfg.strictPort && !!(await discoverLivePort(cfg.range)));
+              if (grew) continue;
+            }
+            process.stderr.write('[mcpctl] bridge DOWN - restarting the host and waiting for it...\n');
+            await restartHost();
+            if (await waitPortOpen(cfg.host, cfg.port, 8000)) continue;
+          }
+        }
         throw new BridgeError(`bridge DOWN at ${mcpUrl()}. ${remediation()}`);
       }
       const state = probe.state === 'ok' ? 'session error' : probe.state;
       if (attempt >= 2) throw new BridgeError(`bridge ${state} persists after retries. ${remediation()}`);
+      // A zombie host on this port (extension gone, process still listening)
+      // must not win over a HEALTHY instance one slot over - so look for a live
+      // one before reaching for the kill. Only if none exists do we restart.
+      if (!cfg.strictPort) {
+        const found = await discoverLivePort(cfg.range);
+        if (found && found.port !== cfg.port) {
+          process.stderr.write(`[mcpctl] bridge ${state} on :${cfg.port} - live instance found, switching to ${cfg.host}:${found.port}\n`);
+          cfg.port = found.port;
+          continue;
+        }
+      }
       process.stderr.write(`[mcpctl] bridge ${state} (${String(probe.note || '').slice(0, 80)}) - restarting host...\n`);
-      const ok = await restartHost();
-      if (!ok) throw new BridgeError(`host did not respawn with a working extension. ${remediation()}`);
+      const rr = await restartHost();
+      if (!rr.ok) throw new BridgeError(`host did not respawn with a working extension. ${remediation()}`);
+      if (rr.port !== cfg.port) cfg.port = rr.port;
     }
   } finally {
     lockHeld = false;
@@ -678,6 +941,41 @@ function tabArg() { return cfg.tab ? { tabId: cfg.tab } : {}; }
 function pretty(v) {
   if (typeof v === 'string') return v;
   return JSON.stringify(v, null, 2);
+}
+
+// chrome_javascript answers with { tabId, result } and `result` is frequently a
+// JSON-encoded *string* ({"a":1} arrives as "{\"a\":1}"). Print it as the value
+// that was actually evaluated instead of a double-encoded envelope, so callers
+// do not have to parse the CLI's output a second time.
+function unwrapJsResult(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+  if (!Object.prototype.hasOwnProperty.call(parsed, 'result')) return parsed;
+  const meta = Object.keys(parsed).filter((k) => k !== 'result' && k !== 'tabId' && k !== 'frameId');
+  if (meta.length) return parsed; // richer shape (other tools) -> leave untouched
+  const v = parsed.result;
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (t && (t[0] === '{' || t[0] === '[')) { try { return JSON.parse(t); } catch (e) { /* keep as string */ } }
+  }
+  return v;
+}
+
+function fmtValue(v) {
+  if (v === undefined) return '(undefined)';
+  if (v === null) return 'null';
+  if (typeof v === 'string') return v;
+  return JSON.stringify(v, null, 2);
+}
+
+// `--in <file>` or a positional `-` reads the payload from a file / stdin, so
+// multi-line JS and nested JSON never have to survive shell quoting.
+function inputArg(flags, positional) {
+  if (flags.in) {
+    try { return fs.readFileSync(String(flags.in), 'utf8'); }
+    catch (e) { throw new UsageError('cannot read --in ' + flags.in + ': ' + e.message); }
+  }
+  if (positional != null && String(positional).trim() === '-') return fs.readFileSync(0, 'utf8');
+  return positional;
 }
 
 function out(o) {
@@ -736,7 +1034,19 @@ function fmtHistory(parsed) {
   return parsed.items.map((h) => `${h.id}  ${h.title || ''}  ${h.url}  (${h.visitCount || 1}x)`).join('\n') || '(none)';
 }
 
+// One line per bridge tool instead of ~330 lines of nested JSON. Descriptions
+// stay available behind --json / --raw.
+function fmtTools(o) {
+  if (!o || !Array.isArray(o.tools)) return pretty(o);
+  const lines = o.tools.map((t) => `${(t.name || '?').padEnd(36)} ${(t.props || []).join(', ')}`.replace(/\s+$/, ''));
+  return lines.join('\n') + `\n\n${o.tools.length} tools - add --json for full schemas`;
+}
+
 // ------------------------------------------------------------------- args ---
+// Flags that take NO value. Without this, `mcpctl --raw eval 'x'` swallowed
+// "eval" as the value of --raw and then died with "unknown command: x".
+const BOOLEAN_FLAGS = new Set(['json', 'quiet', 'raw', 'interactive', 'full', 'html', 'double', 'bodies', 'static', 'errors', 'clear', 'buffer', 'main', 'no-launch', 'exclude-open', 'strict-port', 'force']);
+
 function parseFlags(argv, known) {
   const flags = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -744,7 +1054,8 @@ function parseFlags(argv, known) {
     if (a.startsWith('--')) {
       const name = a.slice(2);
       if (known.includes(name)) {
-        if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[name] = argv[++i];
+        if (BOOLEAN_FLAGS.has(name)) flags[name] = true;
+        else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[name] = argv[++i];
         else flags[name] = true;
       } else {
         throw new UsageError(`unknown flag --${name}`);
@@ -756,7 +1067,7 @@ function parseFlags(argv, known) {
   return flags;
 }
 
-const GLOBAL_FLAGS = ['json', 'tab', 'timeout', 'port', 'host', 'lock-timeout', 'browser', 'range'];
+const GLOBAL_FLAGS = ['json', 'tab', 'timeout', 'port', 'host', 'lock-timeout', 'browser', 'range', 'quiet', 'raw', 'strict-port'];
 
 // Consume ONLY the leading run of global `--flag value` pairs and hand back the
 // rest. parseFlags() over the whole argv cannot be used here: it rejects any
@@ -768,6 +1079,7 @@ function extractLeadFlags(argv, known) {
   while (i < argv.length && argv[i].startsWith('--')) {
     const name = argv[i].slice(2);
     if (!known.includes(name)) break; // belongs to the command, not the prefix
+    if (BOOLEAN_FLAGS.has(name)) { flags[name] = true; i += 1; continue; }
     const next = argv[i + 1];
     if (next !== undefined && !next.startsWith('--')) { flags[name] = next; i += 2; }
     else { flags[name] = true; i += 1; }
@@ -778,12 +1090,15 @@ function extractLeadFlags(argv, known) {
 
 function applyGlobalFlags(flags) {
   if (flags.json) cfg.json = true;
+  if (flags.quiet) cfg.quiet = true;
+  if (flags.raw) cfg.raw = true;
   if (flags.tab != null) cfg.tab = parseInt(flags.tab, 10);
   if (flags.timeout != null) cfg.timeout = parseInt(flags.timeout, 10) * 1000;
   if (flags.port != null) cfg.port = parseInt(flags.port, 10);
   if (flags.host) cfg.host = flags.host;
   if (flags['lock-timeout'] != null) cfg.lockTimeout = parseInt(flags['lock-timeout'], 10) * 1000;
   if (flags.browser) cfg.browser = String(flags.browser);
+  if (flags['strict-port']) cfg.strictPort = true;
   if (flags.range) cfg.range = String(flags.range);
 }
 
@@ -1047,8 +1362,8 @@ async function cmdUpload(sessionId, flags) {
 }
 
 async function cmdInject(sessionId, flags) {
-  const src = flags._.join(' ');
-  if (!src) return { ok: false, text: 'usage: inject <js script source>' };
+  const src = inputArg(flags, flags._.join(' '));
+  if (!src) return { ok: false, text: 'usage: inject <js script source>   (or: inject - | inject --in file.js)' };
   const args = { jsScript: src };
   if (flags.main) args.type = 'MAIN';
   return callTool(sessionId, 'chrome_inject_script', Object.assign(args, tabArg()));
@@ -1116,6 +1431,53 @@ async function cmdTools(sessionId, flags) {
   return { ok: true, count: list.length, tools: list };
 }
 
+// reap: kill every host in the scan range that is NOT healthy - wedged 'busy'
+// hosts (stale transport from a dead client) and 'broken' zombies. The healthy
+// instance (if any) is left alone. A 'busy' port whose cross-process lock is
+// held by a LIVE pid is skipped: that is a real client mid-call, not a zombie.
+async function cmdReap(flags) {
+  const range = flags.range || cfg.range || PORT_RANGE;
+  const found = await scanInstances(range, 2500);
+  const healthy = found.filter((r) => r.state === 'ok').map((r) => r.port);
+  const killed = [];
+  const skipped = [];
+  for (const k of found.filter((r) => r.state === 'busy' || r.state === 'broken')) {
+    const saved = cfg.port;
+    cfg.port = k.port;
+    try {
+      const lockPid = (() => { try { return parseInt(fs.readFileSync(lockFilePath(), 'utf8'), 10); } catch (e) { return null; } })();
+      if (k.state === 'busy' && lockPid && pidAlive(lockPid)) {
+        skipped.push({ port: k.port, state: k.state, reason: `live mcpctl pid ${lockPid} holds the lock` });
+        continue;
+      }
+      const pid = hostPid();
+      if (!pid) continue;
+      if (killPid(pid)) killed.push({ port: k.port, pid, state: k.state });
+    } finally { cfg.port = saved; }
+  }
+  // Give the extension a moment to respawn a clean host for the reaped slots.
+  let respawned = null;
+  if (killed.length) {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline && !respawned) {
+      respawned = await findRespawnedPort();
+      if (!respawned) await sleep(1000);
+    }
+  }
+  return {
+    ok: true,
+    range,
+    killed,
+    skipped,
+    healthy,
+    respawned,
+    note: killed.length
+      ? (respawned ? `reaped ${killed.length} zombie host(s); bridge healthy on ${cfg.host}:${respawned}`
+                   : `reaped ${killed.length} zombie host(s); no respawn yet - the extension reconnects on its next alarm`)
+      : (healthy.length ? 'nothing to reap - all hosts healthy' : 'nothing listening to reap'),
+  };
+}
+
 async function cmdInstances(sessionId, flags) {
   // Multi-browser discovery: scan the port range and identify every live
   // bridge instance (browser, label, instanceId, endpoint, selector).
@@ -1168,10 +1530,52 @@ async function cmdLabel(sessionId, flags, name) {
   };
 }
 
+// ---------------------------------------------------------- intercept proxy ---
+// Route the browser's ENTIRE traffic through a local intercepting proxy (Caido
+// on 127.0.0.1:9999 by default) so every request — XHR, subresources,
+// navigations, service workers, websockets — lands in the interceptor's history
+// instead of only the tabs we explicitly capture. Talks to the extension's
+// chrome_proxy tool through the record_replay_flow_run dispatcher, which also
+// works before the host re-handshakes and publishes flow.proxy.
+async function cmdCaido(sessionId, flags) {
+  const raw = String(flags._[0] || 'status').toLowerCase();
+  const action = raw === 'enable' ? 'on' : raw === 'disable' ? 'off' : raw;
+  if (!['on', 'off', 'status'].includes(action)) {
+    return { ok: false, text: 'caido subcommands: on [--proxy-port N] [--proxy-host H] [--force], off, status' };
+  }
+  const args = { action };
+  if (flags['proxy-host']) args.host = flags['proxy-host'];
+  if (flags['proxy-port']) args.port = parseInt(flags['proxy-port'], 10);
+  if (flags.force) args.force = true;
+
+  let r;
+  try {
+    r = await callTool(sessionId, 'record_replay_flow_run', { flowId: 'proxy', args });
+    if (!r.ok && /unknown published tool|not registered/i.test(r.text || '')) throw new Error(r.text);
+  } catch (e) {
+    // Older extension without the published entry: fall back to the raw tool.
+    r = await callTool(sessionId, 'chrome_proxy', args);
+  }
+  if (!r.ok) return r;
+
+  const d = r.parsed || {};
+  let text;
+  if (action === 'status') {
+    text = d.enabled
+      ? `interception ON -> ${d.host}:${d.port} (${d.reachable === false ? 'port NOT answering' : 'reachable'})`
+      : `interception off${d.reachable === false ? ' (nothing listening on the configured proxy port)' : ''}`;
+  } else if (d.enabled) {
+    text = `interception ON -> http://${d.host}:${d.port}${d.reachable === false ? ' (warning: port did not answer)' : ''}\n${d.message || ''}`.trim();
+  } else {
+    text = `interception off${d.warning ? '\n' + d.warning : ''}`;
+  }
+  return { ok: true, parsed: d, text, enabled: !!d.enabled, port: d.port || null };
+}
+
 async function cmdCall(sessionId, flags) {
   const tool = flags._[0];
-  const argsJson = flags._.slice(1).join(' ') || '{}';
-  if (!tool) return { ok: false, text: 'usage: call <tool> [json args]' };
+  const argsJson = inputArg(flags, flags._.slice(1).join(' ')) || '{}';
+  if (!tool) return { ok: false, text: 'usage: call <tool> [json args]   (or: call <tool> -  to read JSON args from stdin)' };
   let args = {};
   try { args = JSON.parse(argsJson); } catch (e) { return { ok: false, text: 'bad args JSON: ' + e.message }; }
   return callTool(sessionId, tool, args);
@@ -1242,13 +1646,14 @@ async function repl(sessionId) {
 }
 
 const FLAG_WHITELIST = [
-  'json', 'tab', 'timeout', 'port', 'host', 'browser',
+  'json', 'tab', 'timeout', 'port', 'host', 'browser', 'quiet', 'raw', 'in',
   'interactive', 'depth', 'ref', 'full', 'selector', 'out',
   'html', 'text', 'double', 'button', 'value', 'delay',
   'query', 'max', 'ago', 'exclude-open', 'filter', 'bodies', 'static',
   'errors', 'clear', 'buffer', 'pattern', 'limit', 'main',
   'file', 'folder', 'url', 'duration', 'direction', 'amount', 'width', 'height',
-  'wait', 'no-launch', 'lock-timeout', 'range',
+  'wait', 'no-launch', 'lock-timeout', 'range', 'strict-port',
+  'proxy-host', 'proxy-port', 'force',
 ];
 
 async function runCommand(sessionId, cmd, flags, cfgOverride) {
@@ -1268,8 +1673,8 @@ async function runCommand(sessionId, cmd, flags, cfgOverride) {
       case 'read': o = await cmdRead(sessionId, flags); break;
       case 'content': o = await cmdContent(sessionId, flags); break;
       case 'interactive': o = await cmdInteractive(sessionId, flags); break;
-      case 'eval': o = await cmdEval(sessionId, flags, flags._.join(' ')); break;
-      case 'run': o = await cmdRun(sessionId, flags, flags._.join(' ')); break;
+      case 'eval': o = await cmdEval(sessionId, flags, String(inputArg(flags, flags._.join(' ')) || '').trim()); break;
+      case 'run': o = await cmdRun(sessionId, flags, inputArg(flags, flags._.join(' '))); break;
       case 'click': o = await cmdClick(sessionId, flags); break;
       case 'hover': o = await cmdHover(sessionId, flags); break;
       case 'fill': o = await cmdFill(sessionId, flags); break;
@@ -1288,6 +1693,7 @@ async function runCommand(sessionId, cmd, flags, cfgOverride) {
       case 'computer': o = await cmdComputer(sessionId, flags); break;
       case 'tools': o = await cmdTools(sessionId, flags); break;
       case 'call': o = await cmdCall(sessionId, flags); break;
+      case 'caido': case 'proxy': o = await cmdCaido(sessionId, flags); break;
       case 'batch': o = await cmdBatch(sessionId, flags); break;
       case 'browsers': case 'instances': case 'list': o = await cmdInstances(sessionId, flags); break;
       case 'label': o = await cmdLabel(sessionId, flags, flags._.join(' ')); break;
@@ -1304,7 +1710,9 @@ async function runCommand(sessionId, cmd, flags, cfgOverride) {
         else if (cmd === 'bookmarks') o = fmtBookmarks(o.parsed);
         else if (cmd === 'history') o = fmtHistory(o.parsed);
         else if (cmd === 'browsers' || cmd === 'instances' || cmd === 'list') o = fmtInstances(o.instances, cfg.port);
+        else if (cmd === 'tools' && Array.isArray(o.tools)) o = fmtTools(o);
         else if (o.parsed && cmd === 'active' && o.tab) o = JSON.stringify({ tab: o.tab, windows: o.windows }, null, 2);
+        else if ((cmd === 'eval' || cmd === 'run' || cmd === 'call') && o.parsed !== null && !cfg.raw) o = fmtValue(unwrapJsResult(o.parsed));
         else if (o.parsed && typeof o.text === 'string' && o.text.trim()) {
           o = o.parsed !== null ? JSON.stringify(o.parsed, null, 2) : o.text;
         } else if (o.parsed === null && o.text) o = o.text;
@@ -1340,6 +1748,29 @@ async function doctorReport() {
     : (pid ? 'unknown process' : 'no host');
   const allowed = (manifest && manifest.allowed_origins) || [];
   const allowedMatch = extId ? allowed.some((o) => o.includes(extId)) : null;
+  // Which running browser is missing a host manifest (or a manifest listing our
+  // extension ID)? That is THE cause of a native host that reads "offline".
+  const manifests = nativeHostManifestCandidates().map((c) => {
+    let m = null;
+    try { m = JSON.parse(fs.readFileSync(c.path, 'utf8')); } catch (e) { /* absent */ }
+    const origins = (m && m.allowed_origins) || [];
+    return {
+      browser: c.browser,
+      path: c.path,
+      exists: !!m,
+      allowedOurId: m ? origins.some((o) => o.includes(EXT_ID)) : false,
+      hostPath: (m && m.path) || null,
+    };
+  });
+  const runningBrowsers = [
+    ['brave', processRunning('brave.exe')],
+    ['chrome', chromeRunning()],
+    ['edge', processRunning('msedge.exe')],
+  ].filter(([, on]) => on).map(([n]) => n);
+  const unregistered = [...new Set(runningBrowsers.filter((b) => {
+    const forBrowser = manifests.filter((m) => m.browser === b);
+    return forBrowser.length > 0 && !forBrowser.some((m) => m.allowedOurId);
+  }))];
   const o = {
     ok: probe.state === 'ok',
     state: probe.state,
@@ -1366,6 +1797,15 @@ async function doctorReport() {
       expectedId: EXT_ID,
       idMatches: extId ? extId === EXT_ID : null,
       whitelistedInHost: allowedMatch,
+    },
+    nativeHostRegistration: {
+      runningBrowsers,
+      missingForRunningBrowsers: unregistered,
+      manifests,
+      fix: unregistered.length
+        ? 'register the native host for: ' + unregistered.join(', ') +
+          ' (node chrome-mcp-extension/scripts/register-host.js --apply), then reload the extension'
+        : null,
     },
     probeMs: probe.ms,
     note: stateNote(probe.state, probe.note),
@@ -1419,18 +1859,26 @@ async function ensureBridge(flags) {
 // own port is down, or while another client holds every session).
 const DISCOVERY_COMMANDS = ['browsers', 'instances', 'list'];
 
+// Commands where auto-discovery must NOT retarget the port: the discovery
+// commands scan by design, and reap scans on purpose. `restart` is deliberately
+// NOT excluded any more - recovery is its whole job, so when the port it was
+// pointed at is dead it follows the bridge to the port that is actually live
+// (and if none is, the restart branch brings a browser up).
+const NO_AUTO_DISCOVER = DISCOVERY_COMMANDS.concat(['reap']);
+
 // Every command the dispatchers understand, validated BEFORE any bridge work.
 // Otherwise a typo is reported as "bridge DOWN" (exit 3) whenever no browser is
 // connected, and as a usage error (exit 2) when one is - a contract that depends
 // on the environment is not a contract.
 const KNOWN_COMMANDS = new Set([
-  'status', 'restart', 'ping', 'ensure', 'doctor', 'diag',
+  'status', 'restart', 'reap', 'ping', 'ensure', 'doctor', 'diag',
   'tabs', 'windows', 'active', 'switch', 'close',
   'read', 'content', 'interactive', 'eval', 'run',
   'click', 'hover', 'fill', 'keys', 'nav', 'shot',
   'history', 'bookmarks', 'net', 'console', 'dialog', 'upload',
   'inject', 'sendcmd', 'storage', 'computer',
   'tools', 'call', 'batch', 'label', 'repl', 'help', '-h', '--help',
+  'caido', 'proxy',
   ...DISCOVERY_COMMANDS,
 ]);
 
@@ -1439,6 +1887,7 @@ const USAGE = `mcpctl - standalone CLI for the Chrome MCP bridge
 
 Multi-browser: every browser running the extension owns its own MCP port.
   mcpctl browsers                          list every live browser + selectors
+  mcpctl reap                              kill zombie hosts (wedged/broken) across the range; keep healthy ones
   mcpctl --browser <selector> <command>    target ONE browser. Selector can be:
                                              <label>      e.g. work   (set with: mcpctl label work)
                                              <name>:<port> e.g. edge:12311 (always unique)
@@ -1448,7 +1897,17 @@ Multi-browser: every browser running the extension owns its own MCP port.
                                            --port always wins over --browser.
   mcpctl --range N-M ...                   override the scanned port range (default 12306-12340)
 
-Usage: mcpctl <command> [args] [--json] [--tab <id>] [--port <n>] [--browser <selector>] [--range N-M] [--timeout <sec>] [--lock-timeout <sec>]
+Ports are never something you have to know: every command auto-targets the live
+instance, and a DEAD --port is re-discovered (the host moves to the next free
+slot when it respawns). Pass --strict-port (or MCP_STRICT_PORT=1) to pin a port
+literally and never follow the host when it moves.
+
+Usage: mcpctl <command> [args] [--json] [--quiet] [--raw] [--tab <id>] [--port <n>] [--browser <selector>] [--range N-M] [--timeout <sec>] [--lock-timeout <sec>] [--strict-port]
+
+Output: results print as plain values by default (a JS result is auto-unwrapped,
+so "mcpctl eval '1+1'" prints exactly "2"). --raw prints the tool envelope
+verbatim; --json prints the full machine-readable object; --quiet drops the
+informational stderr lines and keeps only the payload.
 
 Commands:
   browsers | instances [--range N-M]
@@ -1461,7 +1920,10 @@ Commands:
   status [--wait N]       Real bridge health (host + extension roundtrip), host PID,
                           plus which browser/instance answered
   ping                    Verify an MCP session + tool roundtrip (reports latency)
-  restart                 Kill the host; the extension respawns it (needs the browser)
+  restart                 Recover the bridge, whatever is wrong: follows the host if it
+                          moved ports, kills a wedged host (extension respawns it), and
+                          launches + waits for a browser when none is running. This is
+                          the one command to run when "mcpctl tabs" says the bridge is down.
   doctor | diag           Full environment report: host, browser, native host manifest,
                           extension ID match - use this when something won't start
   ensure [--wait N] [--no-launch]
@@ -1474,8 +1936,9 @@ Commands:
   read [--interactive] [--depth N] [--ref ref_X]
   content [--selector S] [--html]
   interactive             List clickable/interactable elements
-  eval '<js>'             Run JS expression (result returned)
-  run '<js>'              Run JS block (async body; must return)
+  eval '<js>' | -         Run JS expression and print the VALUE (auto-unwrapped).
+                          '-' reads the JS from stdin; --in <file> from a file.
+  run '<js>' | -          Run JS block (async body; must return). Also takes '-'/--in.
   click <sel|ref> [--double] [--button right]
   hover <sel|ref>
   fill <sel|ref> <value>
@@ -1493,10 +1956,30 @@ Commands:
   storage                 localStorage/sessionStorage/cookies/IndexedDB
   computer <action> [opts]
   tools                   List bridge tools (name + input props)
-  call <tool> '{"args":...}'
+  call <tool> '{"args":...}'|-   Raw tool call; '-' reads the JSON args from stdin.
   batch <file|->          Run [tool,args] pairs in one session (JSON array or JSONL)
+  caido <on|off|status> [--proxy-port N] [--proxy-host H] [--force]
+                          Route ALL browser traffic through a local intercepting
+                          proxy (Caido, default 127.0.0.1:9999) so every request
+                          shows up in the interceptor's history. Refuses to
+                          enable when nothing answers on the port (so browsing
+                          can't break); --force overrides. Alias: proxy.
   repl                    Interactive session ("!tool {json}" for raw calls)
   help
+
+Examples:
+  mcpctl eval 'document.title'
+  mcpctl eval - <<'EOF'          # multi-line JS, no shell quoting
+  (function () {
+    return fetch('/api/me', { credentials: 'include' })
+      .then(r => r.text()).then(t => t.slice(0, 400));
+  })()
+  EOF
+  mcpctl call chrome_javascript - <<'EOF'
+  {"code":"return document.cookie"}
+  EOF
+  mcpctl batch jobs.json              # [["tool",{args}], ...] in one session
+  mcpctl nav https://example.com --quiet && mcpctl eval 'location.href'
 
 Exit codes: 0 ok | 1 runtime error | 2 usage | 3 bridge down/unreachable | 4 another mcpctl busy
 Environment: MCP_PORT, MCP_HOST (defaults 12306 / 127.0.0.1)
@@ -1516,6 +1999,7 @@ async function main() {
 
   if (process.env.MCP_PORT) cfg.port = parseInt(process.env.MCP_PORT, 10);
   if (process.env.MCP_HOST) cfg.host = process.env.MCP_HOST;
+  if (process.env.MCP_STRICT_PORT === '1') cfg.strictPort = true;
 
   // Global flags may also come BEFORE the command for ergonomics:
   //   mcpctl --browser edge status   ==   mcpctl status --browser edge
@@ -1548,6 +2032,27 @@ async function main() {
   }
 
   try {
+    // Port auto-discovery. The extension may be listening on ANY port in the
+    // range, so before a command dies with "bridge DOWN" check whether the
+    // instance moved (or was never on the default port to begin with). Skipped
+    // whenever the caller pinned a port/browser, so explicit intent always wins.
+    // A pinned --port is honored while it is alive. When it is DEAD, discovery
+    // still runs (unless --strict-port / MCP_STRICT_PORT=1): the host moves to
+    // the next free slot whenever it respawns, so a stale port number in a
+    // script or shell history used to fail every command while the bridge sat
+    // healthy one port over. That was the "random port" failure, permanently.
+    const portPinned = (flags.port != null) || (process.env.MCP_PORT != null);
+    if (!flags.browser && !cfg.strictPort && !NO_AUTO_DISCOVER.includes(command)
+      && !(await portOpen(cfg.port, cfg.host, 400))) {
+      const found = await discoverLivePort(flags.range || cfg.range);
+      if (found) {
+        const why = portPinned ? `pinned :${cfg.port} was dead, host moved` : `auto-discovered${found.cached ? ' cached instance' : ''}`;
+        cfg.port = found.port;
+        if (!flags.json && !cfg.quiet) {
+          process.stderr.write(`[mcpctl] bridge on ${cfg.host}:${cfg.port} (${why})\n`);
+        }
+      }
+    }
     // Multi-browser targeting: --browser <selector> resolves to the matching
     // live instance's port. Explicit --port always wins.
     if (flags.browser && !flags.port && !DISCOVERY_COMMANDS.includes(command)) {
@@ -1563,7 +2068,7 @@ async function main() {
         return;
       }
       cfg.port = res.port;
-      if (!flags.json) process.stderr.write(`[mcpctl] targeting ${cfg.host}:${cfg.port} (--browser ${flags.browser})\n`);
+      if (!flags.json && !cfg.quiet) process.stderr.write(`[mcpctl] targeting ${cfg.host}:${cfg.port} (--browser ${flags.browser})\n`);
       if (res.probe && res.probe.state === 'busy') {
         process.stderr.write('[mcpctl] note: that instance\'s session is busy right now - will retry through the lock.\n');
       }
@@ -1586,8 +2091,55 @@ async function main() {
       await acquireLock(cfg.lockTimeout);
       let o;
       try {
-        const ok = await restartHost();
-        o = { ok, hostPid: hostPid() };
+        // 1) The host may have moved to another port after an earlier respawn.
+        //    Follow it first, so `restart` always acts on the live bridge.
+        if (!(await portOpen(cfg.port, cfg.host, 400)) && !cfg.strictPort) {
+          const found = await discoverLivePort(flags.range || cfg.range);
+          if (found) cfg.port = found.port;
+        }
+        // 2) Normal path: kill the host; the extension respawns it (wherever it lands).
+        let r = await restartHost();
+        if (r.ok && r.port !== cfg.port) cfg.port = r.port;
+        // 3) Nothing to restart and nothing listening anywhere: the browser is
+        //    not running (or the extension never spawned a host). `restart` is
+        //    the command people reach for when the bridge is dead, so it now
+        //    brings the whole stack back instead of printing where to look:
+        //    launch a browser and wait, exactly like `ensure`.
+        if (!r.ok && !(await portOpen(cfg.port, cfg.host, 400))) {
+          const healed = await ensureBridge({
+            wait: flags.wait != null ? flags.wait : 60,
+            'no-launch': flags['no-launch'],
+          });
+          o = Object.assign({}, healed, { port: cfg.port, hostPid: hostPid(), healedBy: 'ensure' });
+          if (o.ok) {
+            o.note = `bridge came up healthy on ${mcpUrl()}${healed.launchedBrowser ? ' (launched the browser)' : ''}`;
+          } else if (!browserRunning()) {
+            o.note = 'No Chromium browser is running, so the native host cannot start. Open the browser with the bridge extension loaded, then run "mcpctl restart" again (or "mcpctl ensure" to let this CLI launch it: ' + (browserPath() || 'no browser executable found') + ').';
+          } else {
+            o.note = 'The browser is running but its extension never reached the host. Reload the extension once (chrome://extensions -> Reload) or run "mcpctl doctor".';
+          }
+          out(o);
+          process.exitCode = o.ok ? 0 : 3;
+          return;
+        }
+        o = { ok: r.ok, port: r.port, hostPid: hostPid() };
+        if (r.ok) {
+          o.note = `bridge respawned and healthy on ${mcpUrl(r.port)}`;
+        } else if (!browserRunning()) {
+          o.note = 'No Chromium browser is running, so nothing can respawn the host. Start the browser with the bridge extension loaded, then retry (or run "mcpctl restart" again - it now launches one automatically).';
+        } else {
+          o.note = `host did not respawn on ${mcpUrl()}; the host is still wedged. Run "mcpctl reap", then "mcpctl restart".`;
+        }
+      } finally { releaseLock(); lockHeld = false; }
+      out(o);
+      process.exitCode = o.ok ? 0 : 3;
+      return;
+    }
+    if (command === 'reap') {
+      await acquireLock(cfg.lockTimeout);
+      let o;
+      try {
+        o = await cmdReap(flags);
       } finally { releaseLock(); lockHeld = false; }
       out(o);
       process.exitCode = o.ok ? 0 : 3;

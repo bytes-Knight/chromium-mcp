@@ -63,7 +63,10 @@ mcpctl ensure [--wait N] [--no-launch]
                              bring the bridge up: wait, launch a browser if
                              needed, restart a stale host until a real session
                              roundtrip works
-mcpctl eval "40+2"            run JS in the active tab
+mcpctl eval "40+2"            run JS in the active tab (prints the VALUE: 42)
+mcpctl eval - <<'EOF'         multi-line JS from stdin — no shell quoting
+...js...
+EOF
 mcpctl tabs | active          list windows/tabs, active tab info
 mcpctl switch <tabId>         switch to tab
 mcpctl shot --out t.png       screenshot the active tab
@@ -75,16 +78,25 @@ mcpctl nav https://...        navigate the active tab
 mcpctl net start --bodies     capture network activity
 mcpctl console --errors       poll console messages
 mcpctl tools                  list the bridge's MCP tools
-mcpctl call <tool> <json>     call any bridge tool directly
+mcpctl call <tool> <json>     call any bridge tool directly (`-` = JSON on stdin)
 mcpctl batch file.json        run a JSON-array / JSONL batch of tool calls
 mcpctl repl                   interactive REPL (!tool {json} for raw calls)
 ```
 
-Global flags: `--json` (raw output), `--tab <id>`, `--port <n>`, `--host <h>`,
-`--timeout <sec>`, `--lock-timeout <sec>`, `--browser <selector>`, `--range N-M`
-(also accepted before the command: `mcpctl --browser edge status`,
+Output is quiet by default: a `chrome_javascript` result is unwrapped, so
+`mcpctl eval 'JSON.stringify({a:1})'` prints the object — not a nested,
+backslash-escaped envelope. Flags: `--json` (full machine-readable object),
+`--raw` (tool envelope verbatim), `--quiet` (payload only, no info lines).
+
+Global flags: `--tab <id>`, `--port <n>`, `--host <h>`, `--timeout <sec>`,
+`--lock-timeout <sec>`, `--browser <selector>`, `--range N-M` (also accepted
+before the command: `mcpctl --browser edge status`,
 `mcpctl --range 12306-12340 browsers`). Env vars: `MCP_PORT`, `MCP_HOST`.
 Type `mcpctl help` for per-command flags.
+
+Input that would fight shell quoting (multi-line JS, nested JSON) is read from
+stdin with a positional `-`, or from a file with `--in <file>`:
+`eval`, `run`, `inject`, `call`, and `batch` all accept it.
 
 Exit codes: `0` ok, `1` the command reported a failure (e.g. a tool call
 failed), `2` usage error, `3` bridge down / no instance matched `--browser`,

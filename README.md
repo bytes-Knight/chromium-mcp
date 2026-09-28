@@ -335,7 +335,10 @@ mcpctl doctor                full environment report (host, browser, manifest,
                              extension-ID match) — run when something won't start
 mcpctl ensure [--wait N]     bring the bridge up: wait / launch browser / restart
                              stale host until a real session roundtrip works
-mcpctl eval "40+2"           run JS in the active tab
+mcpctl eval "40+2"           run JS in the active tab (prints the value: 42)
+mcpctl eval - <<'EOF'        multi-line JS via stdin — no shell quoting
+...js...
+EOF
 mcpctl tabs | active         windows/tabs, active tab info
 mcpctl switch <tabId>        switch to tab
 mcpctl shot --out t.png      screenshot the active tab
@@ -347,14 +350,17 @@ mcpctl nav https://...       navigate the active tab
 mcpctl net start --bodies    capture network activity
 mcpctl console --errors      poll console messages
 mcpctl tools                 list the bridge's MCP tools
-mcpctl call <tool> <json>    call any bridge tool directly
+mcpctl call <tool> <json>    call any bridge tool directly ('-' = JSON on stdin)
 mcpctl batch file.json       run a JSON-array / JSONL batch in one session
 mcpctl repl                  interactive REPL (!tool {json} for raw calls)
 ```
 
-Global flags: `--json`, `--tab <id>`, `--port <n>`, `--host <h>`, `--timeout <sec>`,
-`--lock-timeout <sec>`; env vars `MCP_PORT` / `MCP_HOST`. Full command reference:
-[`app/README.md`](app/README.md) or `mcpctl help`.
+Output is quiet by default — JS results are auto-unwrapped, `tools` prints one
+line per tool, and `--json` / `--raw` / `--quiet` control the verbosity. Flags:
+`--tab <id>`, `--port <n>`, `--host <h>`, `--timeout <sec>`, `--lock-timeout <sec>`;
+env vars `MCP_PORT` / `MCP_HOST`. Multi-line JS or nested JSON can be piped in
+rather than quoted (`mcpctl eval -`, `mcpctl call <tool> -`, `--in <file>`).
+Full command reference: [`app/README.md`](app/README.md) or `mcpctl help`.
 
 > Health is measured with a real extension tool roundtrip — never a bare TCP
 > check — so a standalone host without the extension reports `state: broken`,

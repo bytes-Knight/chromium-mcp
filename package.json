@@ -8,7 +8,7 @@
     "mcpctl": "app/bin/mcpctl.js"
   },
   "scripts": {
-    "test": "node scripts/test-instance.js && node scripts/test-mcpctl-instances.js && node scripts/test-launcher.js",
+    "test": "node scripts/test-instance.js && node scripts/test-mcpctl-instances.js && node scripts/test-auto-connect.js && node scripts/test-launcher.js",
     "build": "node app/build.js",
     "build:launcher": "node app/build-launcher.js"
   }
